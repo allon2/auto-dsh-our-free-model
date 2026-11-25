@@ -21,7 +21,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-const REPO = 'Ebony-Vinyl/dsh-our-free-model'
+const REPO = 'allon2/auto-dsh-our-free-model'
 
 /**
  * Feed locations, in preference order.

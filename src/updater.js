@@ -29,7 +29,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 
-const REPO = 'Ebony-Vinyl/dsh-our-free-model'
+const REPO = 'allon2/auto-dsh-our-free-model'
 
 /** Discovery locations, in preference order. Official mutable refs are resolved
  *  to a full commit before fetching either the manifest or its files. Mirrors

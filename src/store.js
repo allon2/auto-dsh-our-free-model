@@ -155,6 +155,14 @@ export const SETTINGS_INITIAL = {
   enabled: true,
   /** Show region-limited models in the picker as soon as they answer. */
   exposeRegionModels: true,
+  /**
+   * Hide the absorbed channels' 13 provider groups from the model picker.
+   *
+   * Display only: the routes stay registered and keep serving the providers that
+   * reach them through the loopback gateway. Off by default so an upgrade never
+   * silently removes models from the picker.
+   */
+  hideChannelModels: false,
   /** Minutes between background availability re-probes. */
   probeIntervalMinutes: 15,
   /** Serve the OpenAI-compatible forward listener for other local harnesses. */
@@ -200,6 +208,11 @@ export const SETTINGS_INITIAL = {
   /** Named fallback chains. A combo is a virtual model whose answer comes from
    *  the first link that produces output; see src/combos.js. */
   combos: [],
+  /** The built-in aggregate route `auto-free-model`: a chain the runtime
+   *  composes over every model the probe calls dialable, walked in order with
+   *  the same advance rules a manual combo uses. Switching it off removes the
+   *  row from the picker; the manual combos above are untouched. */
+  autoChain: true,
   /** The five local answers that avoid a provider call entirely: a quota probe,
    *  a shell command prefix, a session title, a suggestion, a filepath list.
    *  They are pure request-shape matches, so a false positive would answer a real

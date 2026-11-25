@@ -1,7 +1,7 @@
 <div align="center">
   <img src="icon.svg" alt="Our Free Model — free model provider plugin for DeepSeek Harness" width="120">
 
-# dsh-our-free-model
+# auto-dsh-our-free-model
 
 [简体中文](README.md) | **English**
 
@@ -32,6 +32,51 @@
 > It mounts as a pure plugin: no core changes, no build step, zero dependencies.
 
 </div>
+
+---
+
+## ⚡ Aggregate route auto-free-model (this fork)
+
+This repository adds a **unified aggregate route** on top of upstream
+[Ebony-Vinyl/dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model) v2.1.0, and
+renames the package to **`auto-dsh-our-free-model`**.
+
+### What it is
+
+`auto-free-model` is a built-in virtual model: the plugin chains every free model that the probe
+finds dialable on this machine into one fallback route, and the caller only ever sees this single
+model id.
+
+- **Automatic failover** — the request goes to the first member; when a member fails, the plugin
+  classifies the failure and moves to the next one, so the caller just sees one normal answer.
+  Failures that trigger failover include exhausted free quota (`Free usage limit reached`), region
+  blocks (`This model is not available in your country`), gateway 5xx and timeouts.
+- **Self-maintaining membership** — availability is measured from this machine's own network egress
+  (periodic probing): dialable members join the chain, failing or region-blocked members leave it,
+  and they return on their own once they recover. Nothing to maintain by hand.
+- **Your chains are untouched** — the aggregate route is an independent built-in chain; the switch
+  only removes `auto-free-model` from the model list, and chains you built yourself are kept as-is.
+
+### How to use it
+
+1. **Model picker** — pick `auto-free-model` (usually listed first) and chat with it like any model.
+2. **Local OpenAI gateway** — enable the forward on the settings page, point any OpenAI client at
+   the local port and set the model id to `auto-free-model`.
+3. **Switch & members** — settings page "Routing" → the "Unified aggregate route auto-free-model"
+   panel at the top shows the switch, the current members and their lanes; the same switch also
+   lives under "Free models" → "Preferences", and the two stay in sync.
+
+### Code changes in this fork
+
+| Change | Location | Notes |
+| --- | --- | --- |
+| Region-block failover | `src/adapter.js` | `advanceVerdict` forces the next chain member on region-class failures; a direct single-model selection still surfaces the error honestly |
+| Instant re-probe rebuild | `src/core/runtime.js` | the re-probe hook rebuilds the aggregate catalog; new `autoRoute()` read-only descriptor |
+| Routing-page panel | `index.js` · `client.js` | `GET /combos` carries the `auto` descriptor; the routing page renders the switch and members, and toggling rebuilds the catalog at once |
+| Upgrade source points here | `src/updater.js` · `src/feed.js` | the in-app checker reads this repository's manifest, never upstream |
+| Package & mount name | `package.json` · `cordis.patch.yml` | `dsh-our-free-model` → `auto-dsh-our-free-model` (the plugin's internal id and data directory are unchanged) |
+
+When merging a newer upstream release, replay the same changes at the locations above.
 
 ---
 

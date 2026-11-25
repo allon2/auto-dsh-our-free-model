@@ -172,3 +172,67 @@ export function pruneRotation(combos) {
 export function resetRotation() {
   rotation.clear()
 }
+
+/**
+ * The built-in aggregate route.
+ *
+ * `auto-free-model` is a combo-shaped virtual row the runtime composes by
+ * itself: its links are the real models the membership verdict calls dialable
+ * on this egress right now, in catalog order (free, then the absorbed lanes).
+ * Nobody edits it — a listing round or a probe round recomposes it, so a model
+ * that goes away drops out of the chain and one that comes back rejoins it
+ * without anyone opening the routing page. `fallback` on purpose: every turn
+ * starts at the head, so as soon as the best model's quota recovers, traffic
+ * returns to it; a pre-output failure ("Free usage limit reached" among them)
+ * advances to the next link through the same `shouldAdvance` walk a manual
+ * chain uses.
+ *
+ * The id deliberately has no `combo:` prefix — that prefix means "a chain the
+ * user named and stored", and this row is the runtime's own. `auto: true`
+ * marks it so the routing editor's member list can hide it (a chain inside the
+ * auto chain would be a loop, and `buildComboCatalog` drops combo links
+ * anyway) while the picker still advertises it beside the real models.
+ */
+export const AUTO_ENTRY_ID = 'auto-free-model'
+
+/**
+ * Shape the auto route's catalog row from its member entries.
+ *
+ * @param {Array<object>} members - real catalog rows, already filtered by the
+ *   caller through `computeMembership` (unavailable and region-blocked models
+ *   are out; never-probed rows and the absorbed lanes are in)
+ * @param {object} [settings] - `autoChain: false` removes the row entirely
+ * @returns {object|null} a combo-shaped entry, or null when there is nothing
+ *   to chain or the feature is switched off
+ */
+export function buildAutoEntry(members, settings = {}) {
+  if (settings.autoChain === false) return null
+  const seen = new Set()
+  const rows = []
+  for (const entry of Array.isArray(members) ? members : []) {
+    if (entry === null || entry === undefined || isComboEntry(entry)) continue
+    if (typeof entry.id !== 'string' || entry.id === '' || seen.has(entry.id)) continue
+    seen.add(entry.id)
+    rows.push(entry)
+  }
+  if (rows.length === 0) return null
+  return {
+    id: AUTO_ENTRY_ID,
+    name: AUTO_ENTRY_ID,
+    channel: COMBO_CHANNEL,
+    combo: rows.map(entry => entry.id),
+    strategy: 'fallback',
+    stickyLimit: 1,
+    auto: true,
+    // The same intersection rules a manual chain follows: a link that cannot
+    // read images or honour a 1M window must never be handed one.
+    vision: rows.every(entry => entry.vision === true),
+    reasoning: rows.some(entry => entry.reasoning === true),
+    contextWindow: Math.min(...rows.map(entry => number(entry.contextWindow) ?? 131072)),
+    maxOutput: Math.min(...rows.map(entry => number(entry.maxOutput) ?? 32768)),
+    canDisableThinking: rows.every(entry => entry.canDisableThinking !== false),
+    regionSensitive: false,
+    wire: 'chat',
+    lanes: [...new Set(rows.map(entry => entry.channel ?? 'free'))],
+  }
+}

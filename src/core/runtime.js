@@ -3,7 +3,7 @@ import path from 'node:path'
 import { FreeModelAdapter, ROUTE_MAIN, ROUTE_REGION } from '../adapter.js'
 import { buildCatalog, buildEacCatalog, buildKiloCatalog, isEacEntry, isKiloEntry, parseListing, reviveKiloCatalog } from '../catalog.js'
 import { buildAggregateCatalog, isAggregateEntry } from '../aggregate.js'
-import { buildComboCatalog, isComboEntry, normalizeCombos, pruneRotation } from '../combos.js'
+import { AUTO_ENTRY_ID, buildAutoEntry, buildComboCatalog, isComboEntry, normalizeCombos, pruneRotation } from '../combos.js'
 import { JsonStore, SETTINGS_INITIAL, STATS_INITIAL, STATS_VERSION, migrateStats, pruneDays, recordTurn, recordUsage } from '../store.js'
 import { STATE, detectEgress, probeCatalog } from '../probe.js'
 import { CODE, getJson } from '../http.js'
@@ -89,6 +89,9 @@ export function createModelRuntime({
       seen.add(entry.id)
       merged.push(entry)
     }
+    // The auto route is composed from the real rows alone and before the user's
+    // chains join the view, so its links can never be a chain itself.
+    const autoEntry = buildAutoEntry(autoMembers(merged, availability.get(), settings.get()), settings.get())
     const combos = normalizeCombos(settings.get().combos)
     comboCatalog = buildComboCatalog(combos, merged)
     pruneRotation(combos)
@@ -96,6 +99,10 @@ export function createModelRuntime({
       if (seen.has(entry.id)) continue
       seen.add(entry.id)
       merged.push(entry)
+    }
+    if (autoEntry !== null && !seen.has(autoEntry.id)) {
+      seen.add(autoEntry.id)
+      merged.push(autoEntry)
     }
     catalog = merged
   }
@@ -280,6 +287,10 @@ export function createModelRuntime({
     if (disposed) return {}
     availability.update({ at: Date.now(), egress })
     availability.flush()
+    // The auto route's membership is the probe's verdict: recompose the catalog
+    // now, so a model this round dropped (or regained) leaves (or rejoins) the
+    // chain without waiting for the next listing round.
+    rebuildCatalog()
     const verdicts = Object.values(results)
     if (verdicts.length > 0 && verdicts.every(row => row.state === STATE.unavailable)) {
       logger.warn?.(`our-free-model: the gateway refused all ${verdicts.length} models this round (${verdicts[0].detail ?? 'no detail'}); keeping them advertised`)
@@ -322,6 +333,31 @@ export function createModelRuntime({
 
   return {
     state, adapter, refreshCatalog, refreshSealedLane, refreshAvailability, watchEgress, fetchListing,
+    // The built-in aggregate route as the routing page sees it. Its switch
+    // lives in settings and its membership in the probe verdicts, so its row
+    // exists in the catalog only while the switch is on — the descriptor
+    // reports the serving chain when it is live and the would-be members when
+    // it is off, and the chain editor never owns this row either way.
+    autoRoute() {
+      if (disposed) return null
+      // The switch reads first: between a settings write and the next rebuild
+      // the catalog can still carry a row the switch just retired (or lack one
+      // it just asked for), and the stale row must not outvote the setting.
+      const enabled = settings.get().autoChain !== false
+      const row = enabled ? catalog.find(entry => entry.auto === true) : undefined
+      if (row !== undefined) {
+        return { id: AUTO_ENTRY_ID, name: row.name ?? AUTO_ENTRY_ID, enabled: true, models: row.combo ?? [], lanes: row.lanes ?? [] }
+      }
+      const real = catalog.filter(entry => entry.auto !== true && !isComboEntry(entry))
+      const members = autoMembers(real, availability.get(), settings.get())
+      return {
+        id: AUTO_ENTRY_ID,
+        name: AUTO_ENTRY_ID,
+        enabled,
+        models: members.map(entry => entry.id),
+        lanes: [...new Set(members.map(entry => entry.channel ?? 'free'))],
+      }
+    },
     complete: createForwardCompletion({ adapter, state, signal: lifetime.signal }),
     publicModelRows: () => publicModelRows(state()),
     // A settings write that changes the aggregate lane or the chains (a key
@@ -370,4 +406,18 @@ export function computeMembership(catalog, availabilitySnapshot, settings) {
   if (main.length > 0) membership[ROUTE_MAIN] = main
   if (region.length > 0) membership[ROUTE_REGION] = region
   return membership
+}
+
+/**
+ * The auto route's links: every real model the membership verdict calls
+ * dialable on the current egress, in catalog order.
+ *
+ * A model that probed unavailable or region-blocked sits the turn out; one
+ * with no verdict yet — never probed, or an absorbed lane with no probe of its
+ * own — is dialable as advertised, which is the same rule the picker follows.
+ */
+function autoMembers(realCatalog, availabilitySnapshot, settings) {
+  const membership = computeMembership(realCatalog, availabilitySnapshot, settings)
+  const byId = new Map(realCatalog.map(entry => [entry.id, entry]))
+  return (membership[ROUTE_MAIN] ?? []).map(id => byId.get(id)).filter(entry => entry !== undefined)
 }

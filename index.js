@@ -46,6 +46,7 @@ import { windowTokens } from './src/stream.js'
 import { AnnouncementFeed } from './src/feed.js'
 import { PluginUpdater } from './src/updater.js'
 import { selfReload, watchPackage, isReloading } from './src/reload.js'
+import { installChannelCatalogVisibility } from './src/channel-visibility.js'
 import { createPushHub } from './src/push.js'
 import { rejectionFor, isLoopbackHost, connectionAdmissionView } from './src/trust.js'
 import { resolveAttributionUserAgent } from './adapter/kernel.js'
@@ -427,7 +428,7 @@ export function apply(ctx, config) {
     onSealedUnavailable: () => logger.warn?.('our-free-model: the sealed lane is not available in this composition (no recognized host profile); its models stay hidden'),
     onTopology: () => emitTopology(),
   })
-  const { state, adapter, refreshCatalog, refreshAvailability, watchEgress, fetchListing, publicModelRows, syncAggregateCatalog } = modelRuntime
+  const { state, adapter, refreshCatalog, refreshAvailability, watchEgress, fetchListing, publicModelRows, syncAggregateCatalog, autoRoute } = modelRuntime
   const runForwarded = modelRuntime.complete
 
   // ── registration ────────────────────────────────────────────────────────────
@@ -1036,6 +1037,14 @@ export function apply(ctx, config) {
    * instead of showing nothing.
    */
   let channelPack = { state: 'pending', error: '' }
+  /**
+   * The channel pack's own catalog gate is keyed on "has a logged-in account",
+   * which is inert once a provider has any credential — and the remote catalog
+   * keeps adding models a per-model blacklist cannot chase. This wrapper turns
+   * that gate into one master switch over all 13 channel groups. It is display
+   * only: routing resolves models through `resolveModel`, never this gate.
+   */
+  let channelVisibility = { installed: false, sync() {} }
   ctx.inject(['credentials', 'commands', 'llm'], scoped => {
     let stopped = false
     scoped.effect(() => () => { stopped = true }, 'our-free-model: channel pack')
@@ -1050,8 +1059,17 @@ export function apply(ctx, config) {
         disableOpencode: true,
         outlet: { active: egressActive, fetch: egressFetch },
       })
+      // `apply` is synchronous and ends with `ctx.provide('accountPool', pool)`,
+      // so the pool is reachable here. Read it non-strictly: the providing fiber
+      // has not reached the active state yet at this point, and a strict `get`
+      // returns `undefined` — which would leave the switch silently unarmed.
+      // Adapters hold that same object and call the wrapped method on every
+      // `listModels()`, so the switch is read live.
+      channelVisibility = installChannelCatalogVisibility(scoped.get('accountPool', false), {
+        shouldHide: () => settings.get().hideChannelModels === true,
+      })
       channelPack = { state: 'ready', error: '' }
-      logger.info?.('our-free-model: free-channel pack mounted (CodeArts, CodeBuddy, and 11 more)')
+      logger.info?.(`our-free-model: free-channel pack mounted (CodeArts, CodeBuddy, and 11 more)${channelVisibility.installed ? ', catalog visibility switch armed' : ''}`)
     }).catch(error => {
       if (stopped) return
       channelPack = { state: 'failed', error: String(error?.message ?? error).slice(0, 300) }
@@ -1151,9 +1169,15 @@ export function apply(ctx, config) {
         combos: normalizeCombos(settings.get().combos),
         // Every id a chain may reference, with the display name the picker uses —
         // the editor offers a searchable list instead of a free-text field, so a
-        // typo cannot become a chain link that silently never resolves.
-        models: state().catalog.map(entry => ({ id: entry.id, name: entry.name, channel: entry.channel ?? 'free', vision: entry.vision === true })),
+        // typo cannot become a chain link that silently never resolves. The
+        // auto route is left out: it is the runtime's own row, and a chain whose
+        // link is the auto chain would be a loop the builder refuses to make.
+        models: state().catalog.filter(entry => entry.auto !== true).map(entry => ({ id: entry.id, name: entry.name, channel: entry.channel ?? 'free', vision: entry.vision === true })),
         strategies: ['fallback', 'round-robin'],
+        // The built-in aggregate route, reported beside the user's chains as a
+        // read-only descriptor: the routing page shows its switch and its live
+        // membership, while `save` keeps writing the user's rows alone.
+        auto: autoRoute(),
       }),
       save: async patch => {
         if (patch === null || typeof patch !== 'object') throw httpError(400, 'the request body must be a JSON object')
@@ -1221,6 +1245,15 @@ export function apply(ctx, config) {
     // The absorbed channel pack's liveness, for the 白嫖接入 page: the page
     // renders its channel grid from this bit plus the pack's own RPC.
     channels: () => channelPack,
+    // The catalog visibility switch lives in `apply`'s scope (it wraps the pool
+    // the pack provides on mount), so the route reaches it through here.
+    channelVisibility: () => channelVisibility,
+    // Rebuilding the catalog is what makes the picker drop the hidden groups:
+    // the client caches one catalog per Host generation, so it needs the event.
+    onTopology: () => emitTopology(),
+    // The settings route has no closure over the runtime, so a switch that
+    // reshapes the catalog (the auto route's own switch) reaches it through here.
+    syncCatalog: () => syncAggregateCatalog(),
     chanRelay: {
       status: chanRelayStatus,
       apply: async patch => {
@@ -1872,7 +1905,7 @@ function createApiRoutes(deps) {
       if (method === 'POST' && routePath === '/settings') {
         const patch = await readJson(req)
         const current = deps.settings.get()
-        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch']) }, current)
+        const next = sanitizeSettings({ ...current, ...pick(patch, ['enabled', 'exposeRegionModels', 'hideChannelModels', 'probeIntervalMinutes', 'defaultMaxTokens', 'announcementAck', 'feedUrl', 'feedPollMinutes', 'notifyOs', 'updateCheckHours', 'autoReloadWatch', 'autoChain']) }, current)
         if (patch.forward !== undefined) {
           const forward = { ...(current.forward ?? {}), ...pick(patch.forward, ['enabled', 'host', 'port']) }
           // The listener spends this machine's lane, and a routable bind address
@@ -1921,6 +1954,15 @@ function createApiRoutes(deps) {
         }
         deps.settings.update(next)
         deps.settings.flush()
+        // The auto route's row is built or dropped by the next catalog rebuild;
+        // answer after that rebuild so the routing page's own toggle takes hold
+        // immediately instead of waiting for the next probe round.
+        if (next.autoChain !== current.autoChain) deps.syncCatalog()
+        // Apply the catalog switch before answering: the pack reads it live, so
+        // the next catalog build already reflects the new value. `onTopology`
+        // is what tells the picker to re-fetch instead of keeping its cache.
+        deps.channelVisibility().sync()
+        if (next.hideChannelModels !== current.hideChannelModels) deps.onTopology()
         await deps.syncForward()
         await deps.syncRelay()
         await deps.syncEgress()
@@ -2231,6 +2273,7 @@ function publicSettings(settings, forwardInfo, egressInfo) {
   return {
     enabled: settings.enabled !== false,
     exposeRegionModels: settings.exposeRegionModels !== false,
+    hideChannelModels: settings.hideChannelModels === true,
     probeIntervalMinutes: settings.probeIntervalMinutes ?? 15,
     defaultMaxTokens: settings.defaultMaxTokens ?? 32768,
     announcementAck: settings.announcementAck ?? '',
@@ -2251,6 +2294,7 @@ function publicSettings(settings, forwardInfo, egressInfo) {
       stickyLimit: combo.stickyLimit,
       enabled: combo.enabled,
     })),
+    autoChain: settings.autoChain !== false,
     forward: {
       ...(settings.forward ?? {}),
       running: forwardInfo.running,

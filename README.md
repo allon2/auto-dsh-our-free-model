@@ -1,7 +1,7 @@
 <div align="center">
   <img src="icon.svg" alt="Our Free Model — DeepSeek Harness 免费模型插件" width="120">
 
-# dsh-our-free-model
+# auto-dsh-our-free-model
 
 **简体中文** | [English](README_EN.md)
 
@@ -31,6 +31,38 @@
 > 纯插件挂载：不改内核、无构建步骤、零依赖。
 
 </div>
+
+---
+
+## ⚡ 聚合路由 auto-free-model（本 fork 新增）
+
+本仓库在上游 [Ebony-Vinyl/dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model) v2.1.0 的基础上新增了**统一聚合路由**，包名同步改为 **`auto-dsh-our-free-model`**。
+
+### 这是什么
+
+`auto-free-model` 是插件内置的一条虚拟模型：它把当前这台机器探测可用的免费模型自动串成一条接力链，对调用方始终只暴露这一个模型 ID。
+
+- **自动接力**——请求先交给链上第一个成员；某个成员失败时，插件按失败类别判定并自动切到下一个成员，调用方只看到一次正常应答。会触发接力的失败包括：免费额度用尽（`Free usage limit reached`）、地区封锁（`This model is not available in your country`）、网关 5xx / 超时等。
+- **成员自动增删**——模型可用性由本机网络出口实测（定期探测）：探测可用的成员自动入链，探测失败或被地区策略拦截的成员自动移出，恢复后自动回归，无需手动维护。
+- **手动链路零影响**——聚合路由是一条独立的内置链路，与你手动创建的降级链互不干扰；开关关闭只是把 `auto-free-model` 从模型列表撤下，手动链路原样保留。
+
+### 怎么用
+
+1. **模型选择器**——直接选 `auto-free-model`（通常排在列表最前），像用普通模型一样对话即可。
+2. **本地 OpenAI 网关**——设置页「白嫖接入」开启转发后，任意 OpenAI 客户端把 Base URL 指到本地端口，模型 ID 填 `auto-free-model`。
+3. **开关与成员查看**——设置页「路由」→ 顶部「统一聚合路由 auto-free-model」面板：开关 + 当前成员列表 + 车道标注；设置页「免费模型」→ 底部「偏好设置」里是同一个开关，两处状态实时同步。
+
+### 本 fork 的代码改动
+
+| 改动 | 位置 | 说明 |
+| --- | --- | --- |
+| 地区封锁自动接力 | `src/adapter.js` | `advanceVerdict` 对 region 类失败强制换下一个链成员；单个模型直选仍如实报错 |
+| 区域剔除即时生效 | `src/core/runtime.js` | 重探钩子重建聚合目录；新增 `autoRoute()` 只读描述符 |
+| 路由页聚合面板 | `index.js` · `client.js` | `GET /combos` 附带 `auto` 描述符；路由页顶部渲染开关与成员，切换即时重建目录 |
+| 升级源指向本仓库 | `src/updater.js` · `src/feed.js` | 应用内检查本仓库的 manifest，不会升级回上游 |
+| 包名与挂载名 | `package.json` · `cordis.patch.yml` | `dsh-our-free-model` → `auto-dsh-our-free-model`（插件内部 ID 与数据目录不变） |
+
+合并上游新版本时，在上述位置重放同样的改动即可。
 
 ---
 

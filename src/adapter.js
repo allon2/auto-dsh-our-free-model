@@ -31,7 +31,7 @@ import { isEacEntry, isKiloEntry } from './catalog.js'
 import { isComboEntry, comboChain } from './combos.js'
 import { applyTokenSavers, saverConfig } from './token-saver/index.js'
 import { classifyFailure, describeVerdict, shouldAdvance } from './route/classify.js'
-import { FALLBACK_IMAGE_PRICING } from './image-pricing.js'
+import { PIXEL_IMAGE_PRICING } from './image-pricing.js'
 
 export const ROUTE_MAIN = 'our-free-model'
 export const ROUTE_REGION = 'our-free-model-region'
@@ -97,10 +97,10 @@ export class FreeModelAdapter {
    *
    * @param {string} _provider - a route passed to `registerAdapter()` for this instance.
    * @param {string} _model - exact model id passed to GenerateOptions.model.
-   * @returns {typeof FALLBACK_IMAGE_PRICING} 视觉 Token 估算，不是厂商真实消耗。
+   * @returns {typeof PIXEL_IMAGE_PRICING} 视觉 Token 估算，不是厂商真实消耗。
    */
   imageRequestPricing(_provider, _model) {
-    return FALLBACK_IMAGE_PRICING
+    return PIXEL_IMAGE_PRICING
   }
 
   /** Models this route advertises right now. */
@@ -494,6 +494,14 @@ export class FreeModelAdapter {
       const advanceVerdict = (code, message, status) => {
         if (plan.allowAdvance !== true || options.signal?.aborted === true || sawAnswer) return { advance: false, verdict: null }
         const verdict = classifyFailure({ status, code, message })
+        // A region refusal keeps its non-rotating verdict in the router
+        // vocabulary (the gate clears on egress, not on another candidate of
+        // the same lane), but inside a chain it is just one dead link: the next
+        // candidate — usually on another lane — can answer, and
+        // `onRegionBlocked` has already benched this model from the membership.
+        // "This model is not available in your country" must advance, not end
+        // the turn (the combos module header promises exactly this).
+        if (code === CODE.region) return { advance: true, verdict: { ...verdict, retryable: true, rule: `region-advance (${verdict.rule})` } }
         return { advance: shouldAdvance(verdict), verdict }
       }
       try {
