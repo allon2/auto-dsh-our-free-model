@@ -46,6 +46,34 @@ const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
 const manifestPath = path.join(root, 'feed', 'manifest.json')
 const integrityPath = path.join(root, 'catalog', 'integrity.json')
 
+// The desktop installer and its embedded service each read their own version
+// metadata. Require those values to match the release before building or
+// checking the manifest.
+const desktopRoot = 'packages/desktop'
+const standaloneRoot = 'packages/standalone'
+const read = file => fs.readFileSync(path.join(root, file), 'utf8')
+const versionOf = file => JSON.parse(read(file)).version
+const standaloneLock = JSON.parse(read(`${standaloneRoot}/package-lock.json`))
+const releaseVersions = {
+  [`${desktopRoot}/package.json`]: versionOf(`${desktopRoot}/package.json`),
+  [`${desktopRoot}/src-tauri/tauri.conf.json`]: versionOf(`${desktopRoot}/src-tauri/tauri.conf.json`),
+  [`${desktopRoot}/src-tauri/Cargo.toml`]: /^version = "(.+)"$/m.exec(read(`${desktopRoot}/src-tauri/Cargo.toml`))[1],
+  [`${desktopRoot}/src-tauri/Cargo.lock`]: (() => {
+    const lock = read(`${desktopRoot}/src-tauri/Cargo.lock`)
+    const entry = lock.indexOf('name = "ofm-desktop"')
+    return /^version = "(.+)"$/m.exec(lock.slice(entry))[1]
+  })(),
+  [`${standaloneRoot}/package.json`]: versionOf(`${standaloneRoot}/package.json`),
+  [`${standaloneRoot}/package-lock.json (version)`]: standaloneLock.version,
+  [`${standaloneRoot}/package-lock.json (root package version)`]: standaloneLock.packages?.['']?.version,
+}
+for (const [file, version] of Object.entries(releaseVersions)) {
+  if (version !== pkg.version) {
+    console.error(`${file} is version ${version}, but package.json is ${pkg.version} — bump the release versions together`)
+    process.exit(1)
+  }
+}
+
 const keyArg = process.argv.indexOf('--key') === -1 ? null : process.argv[process.argv.indexOf('--key') + 1]
 const keyPath = keyArg ?? process.env.OFM_MANIFEST_KEY ?? ''
 let signingKey = null
@@ -103,6 +131,13 @@ function addFile(rel) {
 }
 
 files.sort((a, b) => a.path.localeCompare(b.path))
+// The current updater accepts 128 files. Older upgraders below 2.7.2 were
+// already unable to read the 93-file 2.7.1 manifest; 2.7.2 shipped the wider
+// reader, so this build keeps the shared 128-file budget instead of the
+// historical 80-file ceiling.
+if (files.length > 128 || files.some(file => file.size > 4 * 1024 * 1024)) {
+  throw new Error('发布内容超出升级器预算：最多 128 个文件，每个最多 4 MiB；先构建兼容资源')
+}
 
 let previous
 try { previous = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) } catch { /* first manifest */ }

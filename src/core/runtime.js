@@ -1,22 +1,56 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { FreeModelAdapter, ROUTE_MAIN, ROUTE_REGION } from '../adapter.js'
-import { buildCatalog, buildEacCatalog, buildKiloCatalog, isEacEntry, isKiloEntry, parseListing, reviveKiloCatalog } from '../catalog.js'
+import { buildCatalog, buildEacCatalog, buildKiloCatalog, catalogFamilyKeys, isEacEntry, isKiloEntry, parseListing, reviveKiloCatalog } from '../catalog.js'
 import { buildAggregateCatalog, isAggregateEntry } from '../aggregate.js'
 import { AUTO_ENTRY_ID, buildAutoEntry, buildComboCatalog, isComboEntry, normalizeCombos, pruneRotation } from '../combos.js'
-import { JsonStore, SETTINGS_INITIAL, STATS_INITIAL, STATS_VERSION, migrateStats, pruneDays, recordTurn, recordUsage } from '../store.js'
+import { JsonStore, SETTINGS_INITIAL, STATS_INITIAL, STATS_VERSION, buildModelVisibility, migrateStats, pruneDays, recordTurn, recordUsage, isModelHidden } from '../store.js'
 import { STATE, detectEgress, probeCatalog } from '../probe.js'
-import { CODE, getJson } from '../http.js'
+import { CODE, UpstreamError, getJson } from '../http.js'
+import { runModelTest, modelAvailability } from '../model-test.js'
+import { DEFAULT_LEVEL } from '../effort.js'
 import { fetchSealedListing } from '../eac.js'
 import { fetchKiloListing } from '../kilo.js'
-import { mintRequestId, sessionForConversation } from '../upstream.js'
+import { sessionForConversation } from '../upstream.js'
 import { createForwardCompletion, publicModelRows } from './completion.js'
+import { isSubscriptionEntry, subscriptionCatalog } from '../subscription-adapter.js'
 
 const FALLBACK_CATALOG = buildCatalog([
-  'mimo-v2.6-flash-free', 'mimo-v2.5-free', 'ling-3.0-flash-fin-free',
-  'nemotron-3-ultra-free', 'nemotron-3.5-lightning-free', 'space-bunny-free',
-  'muse-spark-1.3-contributor-free', 'muse-spark-1.2-contributor-free',
+  'deepseek-v4.1-flash-free', 'glm-5.3-flash-free', 'mimo-v2.6-flash-free',
+  'nemotron-3.5-lightning-free', 'nemotron-3.5-super-vl-free', 'flint-40b-free',
 ])
+
+/**
+ * The free lane's quota breaker default (issue #708/#767): the upstream counts
+ * usage per egress IP and answers an exhausted one with `FreeUsageLimitError`
+ * and a `Retry-After` of hours. When a response carries no usable
+ * `Retry-After`, the lane assumes this window rather than re-asking.
+ */
+const LANE_QUOTA_DEFAULT_MS = 6 * 60 * 60 * 1000
+
+/**
+ * How long a breaker may refuse traffic on one `Retry-After`'s word.
+ *
+ * The header is attacker-adjacent data: it arrives from the upstream, but also
+ * from any CDN, WAF or proxy in front of it, and `Date.now() + retryAfter` was
+ * taken at face value. Measured 2026-11-22: one 429 carrying `Retry-After:
+ * 70411` opened a 19.6-hour window on an exit that answered 200 seventeen
+ * minutes later — and because the gate sits in front of every request, that
+ * lock was self-fulfilling for the rest of the day.
+ *
+ * 30 minutes is the same ceiling `src/route/classify.js` already applies to
+ * this exact header (`MAX_PROVIDER_COOLDOWN_MS`). Being wrong here is cheap:
+ * the worst case is one refused request that finds the wall still standing and
+ * re-opens the window. Being wrong the other way costs the user a day.
+ */
+const LANE_QUOTA_MAX_MS = 30 * 60 * 1000
+
+/** Clamp an upstream-requested window into `(0, LANE_QUOTA_MAX_MS]`. */
+function laneWindowFor(retryAfterMs) {
+  const asked = Number(retryAfterMs)
+  if (!Number.isFinite(asked) || asked <= 0) return LANE_QUOTA_DEFAULT_MS
+  return Math.min(Math.trunc(asked), LANE_QUOTA_MAX_MS)
+}
 
 /** 路径由产品入口决定；核心不解析 DSH_HOME，也不发现宿主服务。 */
 export function createRuntimeStores({ dataDir, logger = console }) {
@@ -27,7 +61,16 @@ export function createRuntimeStores({ dataDir, logger = console }) {
   const open = (file, initial) => new JsonStore(path.join(dataDir, file), structuredClone(initial), {
     log: message => logger.warn?.(message),
   })
-  const settings = open('settings.json', SETTINGS_INITIAL)
+  // Seed the recommended combo only for a genuinely fresh install. Existing
+  // settings files that predate combos must not gain a new advertised model
+  // merely because a new default was added to SETTINGS_INITIAL; user edits to
+  // an existing `combos` field still win through JsonStore's normal merge.
+  const settingsInitial = structuredClone(SETTINGS_INITIAL)
+  const settingsPath = path.join(dataDir, 'settings.json')
+  if (fs.existsSync(settingsPath)) settingsInitial.combos = []
+  const settings = new JsonStore(settingsPath, settingsInitial, {
+    log: message => logger.warn?.(message),
+  })
   const stats = open('stats.json', STATS_INITIAL)
   const availability = open('availability.json', { version: 1, at: 0, egress: null, results: {} })
   const catalogStore = open('catalog.json', { version: 1, at: 0, entries: FALLBACK_CATALOG.map(entry => entry.id) })
@@ -43,6 +86,8 @@ export function createRuntimeStores({ dataDir, logger = console }) {
 /**
  * 两个产品共同使用的模型运行时。宿主仅注入能力，不传入 Cordis ctx。
  * 创建不启动网络任务；入口先绑定本地监听器，再决定何时刷新和探测。
+ * Optional subscriptionRuntime supplies catalog() and complete(request, onChunk);
+ * its helper owns accounting. Call syncAggregateCatalog() after account mutations.
  */
 export function createModelRuntime({
   settings, stats, availability, catalogStore,
@@ -52,22 +97,36 @@ export function createModelRuntime({
   sealedCredential = () => null,
   onSealedUnavailable = () => {},
   onTopology = () => {},
+  subscriptionRuntime,
+  extensionRuntime = null,
 }) {
   let catalog = materializeCatalog(catalogStore.get().entries ?? [])
-  let sealedCatalog = sealedCredential() === null ? [] : buildEacCatalog(catalogStore.get().sealIds ?? [])
+  // The persisted sealIds can carry ids written by an older build (a listing
+  // row stringified to "[object Object]" was stored before buildEacCatalog
+  // learned to unwrap rows). Drop anything that is not a plausible model id so
+  // a stale store cannot render a card named "EAC [object Object]"; the next
+  // successful listing rewrites the store anyway.
+  let sealedCatalog = sealedCredential() === null ? [] : buildEacCatalog(
+    (catalogStore.get().sealIds ?? []).filter(id => typeof id === 'string' && id !== '' && !id.includes('[object ')),
+  )
   let kiloCatalog = reviveKiloCatalog(catalogStore.get().kiloRows)
   /** The aggregate lane: one row per enabled provider/model the user configured.
    *  Derived from settings, not from a listing, so it is rebuilt on every merge. */
   let aggregateCatalog = []
+  let subscriptionEntries = []
   /** The virtual rows a combo contributes; rebuilt last, after every real lane. */
   let comboCatalog = []
+  /** The extension lane: rows served by installed, enabled channel extensions. */
+  let extensionCatalog = []
+  /** The directory-confirmed full ids that may share a hidden-model family. */
+  let familyKeysById = new Map()
   /** The free lane's own roster: the base every other lane is merged onto. */
   let freeCatalog = catalog
   let egress = availability.get().egress ?? null
   let gatewayLatency = { ms: 0, at: 0 }
   let disposed = false
   const lifetime = new AbortController()
-  let reprobeTimer
+  let egressGeneration = 0
 
   /**
    * Rebuild the merged catalog from its parts, in precedence order.
@@ -82,46 +141,155 @@ export function createModelRuntime({
    * instead of keeping a hopeful placeholder.
    */
   const rebuildCatalog = () => {
+    // An extension that `replaces` a built-in lane takes its ids over, so the
+    // lane it replaced must stand down or every model would appear twice.
+    const replacedLane = extensionRuntime?.replacesLane ?? null
+    const laneStandsDown = entry => replacedLane === 'kilo' && isKiloEntry(entry)
     const seen = new Set()
     const merged = []
-    for (const entry of [...freeCatalog, ...sealedCatalog, ...kiloCatalog, ...aggregateCatalog]) {
-      if (entry === null || entry === undefined || seen.has(entry.id)) continue
-      seen.add(entry.id)
-      merged.push(entry)
-    }
-    // The auto route is composed from the real rows alone and before the user's
-    // chains join the view, so its links can never be a chain itself.
-    const autoEntry = buildAutoEntry(autoMembers(merged, availability.get(), settings.get()), settings.get())
-    const combos = normalizeCombos(settings.get().combos)
-    comboCatalog = buildComboCatalog(combos, merged)
-    pruneRotation(combos)
-    for (const entry of comboCatalog) {
+    const candidates = []
+    for (const entry of [...freeCatalog, ...sealedCatalog, ...kiloCatalog, ...aggregateCatalog, ...extensionCatalog, ...subscriptionEntries]) {
+      if (entry === null || entry === undefined || laneStandsDown(entry)) continue
+      candidates.push(entry)
       if (seen.has(entry.id)) continue
       seen.add(entry.id)
       merged.push(entry)
     }
-    if (autoEntry !== null && !seen.has(autoEntry.id)) {
-      seen.add(autoEntry.id)
-      merged.push(autoEntry)
+    const combos = normalizeCombos(settings.get().combos)
+    comboCatalog = buildComboCatalog(combos, merged)
+    pruneRotation(combos)
+    for (const entry of comboCatalog) {
+      candidates.push(entry)
+      if (seen.has(entry.id)) continue
+      seen.add(entry.id)
+      merged.push(entry)
     }
+    familyKeysById = catalogFamilyKeys(candidates)
     catalog = merged
   }
   const mergeCatalogs = () => {
     aggregateCatalog = buildAggregateCatalog(settings.get().aggregate ?? {})
+    subscriptionEntries = subscriptionCatalog(subscriptionRuntime)
+    extensionCatalog = extensionRuntime === null ? [] : extensionRuntime.catalog ?? []
     rebuildCatalog()
   }
   mergeCatalogs()
-  const state = () => ({
-    catalog,
-    membership: computeMembership(catalog, availability.get(), settings.get()),
-    settings: settings.get(),
-    attributionUserAgent,
-  })
+  const state = () => {
+    const settingsSnapshot = settings.get()
+    const visibility = buildModelVisibility(settingsSnapshot, familyKeysById)
+    // The auto route is composed at read time, never stored: its links are
+    // whatever the latest verdicts call dialable, so every consumer — the
+    // picker, the routing page, the forward gateway — sees the same fresh
+    // chain and nobody has to remember to rebuild after a probe round, a
+    // passive verdict or a manual test. The second pass folds the composed
+    // row into the membership like any other dialable model.
+    const links = autoLinks(computeMembership(catalog, availability.get(), settingsSnapshot, visibility), catalog)
+    const rows = withAutoRoute(catalog, buildAutoEntry(links, settingsSnapshot))
+    return {
+      catalog: rows,
+      membership: computeMembership(rows, availability.get(), settingsSnapshot, visibility),
+      settings: settingsSnapshot,
+      visibility,
+      attributionUserAgent,
+      lane: laneRow(),
+      routing: {
+        quota: subscriptionRuntime?.routingQuota?.() ?? {},
+        usage: Object.fromEntries(rows.map(row => [row.id, stats.get().models?.[row.id]?.calls ?? 0])),
+      },
+    }
+  }
   const emitTopology = () => { if (!disposed) onTopology() }
+
+  // ── the free lane's quota breaker and passive availability (#708/#767) ──────
+  /**
+   * The upstream counts the free tier per egress IP, and a burned one answers
+   * every request — any model, any session — with `FreeUsageLimitError` and a
+   * `Retry-After` of hours. Before the breaker, the lane learned this by
+   * spending probes against the wall; now the wall is recorded once, from real
+   * traffic, and every later request is refused locally until the window ends.
+   * `state`:
+   *   - `ok`      — no verdict against the current exit.
+   *   - `quota`   — a real 429; `retryAt` is when the window ends.
+   *   - `locked`  — the client gate (`FreeTierError`): no window, waiting
+   *                 cannot help; a lane-exit change clears it.
+   * An egress change clears the state either way: a new exit is a new bucket.
+   */
+  function laneRow() {
+    return availability.get().lane ?? null
+  }
+  function setLaneState(laneState, extra = {}) {
+    availability.edit(value => ({ ...value, lane: { state: laneState, at: Date.now(), ...extra } }))
+    availability.flush()
+    emitTopology()
+  }
+  function laneGate() {
+    const lane = laneRow()
+    if (!lane || lane.state === 'ok' || lane.state === undefined) return { ok: true }
+    if (lane.state === 'quota') {
+      if (!Number.isFinite(lane.retryAt) || lane.retryAt <= Date.now()) return { ok: true }
+      // Clamp on read as well as on write. A window recorded by an older build
+      // (or by this one before the cap existed) is already on disk, and the cap
+      // is worthless if it only governs new verdicts: measured 2026-11-22, one
+      // such row refused every request for 19.6 hours while the upstream was
+      // answering 200. `at` is when the verdict was taken, so the effective
+      // deadline is at most `LANE_QUOTA_MAX_MS` after it.
+      const recorded = Number.isFinite(lane.at) ? lane.at : lane.retryAt
+      const retryAt = Math.min(lane.retryAt, recorded + LANE_QUOTA_MAX_MS)
+      if (retryAt <= Date.now()) return { ok: true }
+      return { ok: false, state: 'quota', retryAt, since: lane.at, message: lane.message ?? '' }
+    }
+    if (lane.state === 'locked') {
+      return { ok: false, state: 'locked', since: lane.at, message: lane.message ?? '' }
+    }
+    return { ok: true }
+  }
+  function clearLaneBreaker() {
+    const lane = laneRow()
+    if (!lane || lane.state === 'ok') return false
+    setLaneState('ok')
+    return true
+  }
+  function recordPassiveResult(model, resultState, extra = {}) {
+    availability.edit(value => ({
+      ...value,
+      results: {
+        ...value.results,
+        [model]: { ...(value.results?.[model] ?? {}), state: resultState, source: 'passive', at: Date.now(), ...extra },
+      },
+    }))
+    availability.flush()
+  }
+  function noteFreeLaneOutcome({ entry, ok, error } = {}) {
+    if (disposed || !entry || entry.channel) return
+    if (ok === true) {
+      // A real success is the strongest signal the lane is open: clear any
+      // breaker and record the model available from live traffic.
+      const lane = laneRow()
+      if (lane && lane.state !== 'ok') setLaneState('ok')
+      recordPassiveResult(entry.id, STATE.available)
+      return
+    }
+    const code = error?.code
+    if (code === CODE.quota) {
+      const retryAt = Date.now() + laneWindowFor(error?.providerRetryAfterMs)
+      setLaneState('quota', { retryAt, message: String(error?.message ?? 'free usage limit reached').slice(0, 300) })
+      recordPassiveResult(entry.id, STATE.throttled)
+      return
+    }
+    if (code === CODE.laneLocked) {
+      setLaneState('locked', { message: String(error?.message ?? 'the free tier answers this client only').slice(0, 300) })
+      recordPassiveResult(entry.id, STATE.unavailable)
+      return
+    }
+    if (code === CODE.region) recordPassiveResult(entry.id, STATE.regionBlocked)
+  }
+
   const adapter = new FreeModelAdapter({
     state,
     resolveImage,
+    subscriptionRuntime,
     sealedCredential,
+    extensionRuntime,
     recordUsage: record => {
       if (disposed) return
       recordUsage(stats, record)
@@ -129,16 +297,11 @@ export function createModelRuntime({
     },
     recordTurn: record => { if (!disposed) recordTurn(stats, record) },
     warn: message => logger.warn?.(message) ?? logger.log?.(message),
-    onRegionBlocked: () => {
-      if (disposed || reprobeTimer !== undefined) return
-      reprobeTimer = setTimeout(() => {
-        reprobeTimer = undefined
-        if (!disposed) void refreshAvailability(true).catch(error => {
-          logger.warn?.(`our-free-model: region reprobe failed (${error?.message ?? error})`)
-        })
-      }, 4000)
-      reprobeTimer.unref?.()
-    },
+    freeLaneGate: laneGate,
+    onFreeLaneOutcome: noteFreeLaneOutcome,
+    onRegionBlocked: modelId => { if (!disposed) recordPassiveResult(modelId, STATE.regionBlocked) },
+    // Automatic probing is disabled by owner policy: a region refusal from a
+    // real turn stays a turn failure and never fires a background probe.
   })
 
   // 手动强制刷新不能借用一个因限流而跳过探测的普通刷新。
@@ -146,34 +309,51 @@ export function createModelRuntime({
   let catalogRefreshForced = false
   let catalogRefreshProbed = false
   async function refreshCatalog(opts) {
-    const { probe = true, force = false } = opts ?? {}
-    if (disposed) return catalog
+    // Automatic probing is disabled by owner policy: `probe` defaults to false
+    // and every automatic caller passes false. Only an explicit user action (the
+    // reprobe button or an explicit caller) asks for `probe: true`.
+    const { probe = false, force = false, report = false, throttleListing = false } = opts ?? {}
+    // 管理接口按需取本轮结果，其他调用仍返回模型数组。
+    const result = value => report ? value : value.catalog
+    if (disposed) return result({ catalog, sources: {} })
     while (catalogRefresh !== null) {
       const shared = catalogRefresh
       const sharedForced = catalogRefreshForced
       const sharedProbed = catalogRefreshProbed
       const value = await shared
-      if (disposed || ((!force || sharedForced) && (!probe || sharedProbed))) return value
+      if (disposed || ((!force || sharedForced) && (!probe || sharedProbed))) return result(value)
     }
-    const run = refreshCatalogOnce({ probe, force })
+    const run = refreshCatalogOnce({ probe, force, throttleListing })
     catalogRefresh = run
     catalogRefreshForced = force
     catalogRefreshProbed = probe
-    try { return await run } finally {
+    try { return result(await run) } finally {
       if (catalogRefresh === run) {
         catalogRefresh = null; catalogRefreshForced = false; catalogRefreshProbed = false
       }
     }
   }
 
-  async function refreshCatalogOnce({ probe, force }) {
+  /** The listing GET is cheap but not free of the upstream's attention; a
+   * fresh roster within this window keeps the refresh button honest without
+   * re-asking the gateway (the probe-like churn issue #708 complained about). */
+  const LISTING_MIN_INTERVAL_MS = 10 * 60_000
+  let lastListingAt = 0
+  async function refreshCatalogOnce({ probe, force, throttleListing }) {
+    const sources = {}
     let ids = []
-    try {
-      ids = parseListing(await fetchListing())
-    } catch (error) {
-      if (!disposed) logger.warn?.(`our-free-model: model listing refresh failed (${error?.message ?? error}); keeping the cached catalog`)
+    if (throttleListing === true && !force && Date.now() - lastListingAt < LISTING_MIN_INTERVAL_MS && freeCatalog.length > 0) {
+      ids = freeCatalog.map(entry => entry.id)
+      sources.free = { ok: true, count: freeCatalog.length, skipped: 'recent' }
+    } else {
+      try {
+        ids = parseListing(await fetchListing())
+        lastListingAt = Date.now()
+      } catch (error) {
+        if (!disposed) logger.warn?.(`our-free-model: model listing refresh failed (${error?.message ?? error}); keeping the cached catalog`)
+      }
     }
-    if (disposed) return catalog
+    if (disposed) return { catalog, sources }
     if (ids.length > 0) {
       freeCatalog = buildCatalog(ids)
       catalogStore.update({ at: Date.now(), entries: freeCatalog.map(entry => entry.id) })
@@ -182,14 +362,15 @@ export function createModelRuntime({
     } else {
       freeCatalog = materializeCatalog(catalogStore.get().entries ?? [])
     }
-    await refreshSealedRoster()
-    if (disposed) return catalog
-    await refreshKiloRoster()
-    if (disposed) return catalog
+    if (sources.free === undefined) sources.free = { ok: ids.length > 0, count: freeCatalog.length }
+    sources.sealed = await refreshSealedRoster()
+    if (disposed) return { catalog, sources }
+    sources.kilo = { ok: await refreshKiloRoster(), count: kiloCatalog.length }
+    if (disposed) return { catalog, sources }
     mergeCatalogs()
     if (probe) await refreshAvailability(force)
     emitTopology()
-    return catalog
+    return { catalog, sources }
   }
 
   async function refreshSealedRoster() {
@@ -197,27 +378,33 @@ export function createModelRuntime({
     if (credential === null) {
       sealedCatalog = []
       onSealedUnavailable()
-      return
+      return { ok: true, count: 0, skipped: true }
     }
     try {
-      const ids = parseListing(await fetchSealedListing(credential, { signal: lifetime.signal }))
+      // `buildEacCatalog` consumes bare ids, unlike `buildCatalog`, which reads
+      // each row's own capacities. Handing it whole rows stringifies every one
+      // of them to "[object Object]", which collapses the entire sealed roster
+      // into a single bogus entry (OR-011-core-bundle-source-drift).
+      const ids = parseListing(await fetchSealedListing(credential, { signal: lifetime.signal }), { idsOnly: true })
       if (disposed) return
       // 独立应用授权变更时，旧账号正在返回的清单不得覆盖新状态。
-      if (Object.hasOwn(credential, 'userToken') && sealedCredential()?.userToken !== credential.userToken) return
+      if (Object.hasOwn(credential, 'userToken') && sealedCredential()?.userToken !== credential.userToken) return { ok: false, count: sealedCatalog.length, skipped: true }
       if (ids.length > 0) {
         sealedCatalog = buildEacCatalog(ids)
         catalogStore.update({ sealIds: sealedCatalog.map(entry => entry.id) })
       }
+      return { ok: ids.length > 0, count: sealedCatalog.length }
     } catch (error) {
       if (disposed) return
-      if (Object.hasOwn(credential, 'userToken') && sealedCredential()?.userToken !== credential.userToken) return
+      if (Object.hasOwn(credential, 'userToken') && sealedCredential()?.userToken !== credential.userToken) return { ok: false, count: sealedCatalog.length, skipped: true }
       if (error?.code === CODE.credential) {
         sealedCatalog = []
         catalogStore.update({ sealIds: [] })
         logger.warn?.('our-free-model: the sealed lane refused its credential; its models are hidden until it is accepted again')
-        return
+        return { ok: false, count: 0 }
       }
       logger.warn?.(`our-free-model: sealed lane listing failed (${error?.code ?? 'unknown'}); keeping its cached roster`)
+      return { ok: false, count: sealedCatalog.length }
     }
   }
 
@@ -237,17 +424,18 @@ export function createModelRuntime({
       if (payload?.error || !Array.isArray(payload?.data)) throw new Error('invalid Kilo model listing')
       kiloCatalog = buildKiloCatalog(payload.data)
       catalogStore.update({ kiloRows: kiloCatalog })
+      return true
     } catch (error) {
       if (!disposed) logger.warn?.(`our-free-model: Kilo channel listing failed (${error?.code ?? error?.message ?? 'unknown'}); keeping its cached roster`)
+      return false
     }
   }
 
   async function fetchListing() {
     if (disposed) return { data: [] }
     const started = Date.now()
-    const listing = await getJson('/zen/v1/models', {
+    const listing = await getJson('/inference/v1/models', {
       session: sessionForConversation('catalog:our-free-model'),
-      requestId: mintRequestId(),
       attributionUserAgent,
       signal: lifetime.signal,
     })
@@ -256,60 +444,72 @@ export function createModelRuntime({
   }
 
   let probeRound = null
-  let probeThrottleStreak = 0
+  let probeRoundGeneration = 0
   let probeBackoffUntil = 0
-  async function runProbeRound() {
+  /**
+   * One probe, one model — never a round.
+   *
+   * Before 2.8.1 a manual reprobe pinged every free model (concurrency 2), and
+   * the upstream counts those the same as real turns: one button press spent
+   * the lane's whole per-IP window (issue #708). Since then availability is
+   * learned passively from real traffic, and the only probe left is this one:
+   * the model the caller names, or the pinned head of the roster. The quota
+   * breaker refuses the probe while a window is open — checking again cannot
+   * change the answer, only spend the exit's next window sooner.
+   */
+  async function runProbeRound(onlyModel) {
+    const generation = egressGeneration
     // The absorbed channels get no per-model probes: their verdicts would be
     // spent against a different gateway than the one that serves them, and a
-    // roster the listing named is advertised as-is (its health is the listing
-    // round's, refreshed on the same cadence). The aggregate lane is excluded
-    // for a sharper reason — a probe there is a *real request to a provider the
-    // user pays for*, spent to learn something the settings page already knows
-    // (whether a key is configured). A combo is excluded because it has no
-    // endpoint of its own: probing one would send the chain's own id to the free
-    // lane as a model name, spending quota to collect a verdict about nothing.
-    const probeable = catalog.filter(entry => !isEacEntry(entry) && !isKiloEntry(entry) && !isAggregateEntry(entry) && !isComboEntry(entry))
-    const results = await probeCatalog(probeable, { attributionUserAgent, signal: lifetime.signal }, (id, result) => {
-      if (disposed) return
+    // roster the listing named is advertised as-is. The aggregate lane is
+    // excluded for a sharper reason — a probe there is a *real request to a
+    // provider the user pays for*. A combo is excluded because it has no
+    // endpoint of its own.
+    const probeable = catalog.filter(entry => !entry.channel && !isComboEntry(entry))
+    const targets = typeof onlyModel === 'string' && onlyModel !== ''
+      ? probeable.filter(entry => entry.id === onlyModel)
+      : probeable.filter(entry => entry.pinned === true).slice(0, 1).length > 0
+        ? probeable.filter(entry => entry.pinned === true).slice(0, 1)
+        : probeable.slice(0, 1)
+    if (targets.length === 0) return {}
+    const results = await probeCatalog(targets, { attributionUserAgent, signal: lifetime.signal }, (id, result) => {
+      if (disposed || generation !== egressGeneration) return
       availability.edit(value => ({
         ...value,
         results: {
           ...value.results,
           [id]: {
             state: result.state,
+            source: 'manual',
             ...result.detail === undefined ? {} : { detail: result.detail },
             ...result.ttftMs === undefined ? {} : { ttftMs: result.ttftMs },
-            latencyMs: result.latencyMs, at: Date.now(),
+            latencyMs: result.latencyMs, startedAt: result.startedAt, at: Date.now(),
           },
         },
       }))
-    }, 2)
-    if (disposed) return {}
+    }, 1)
+    if (disposed || generation !== egressGeneration) return {}
     availability.update({ at: Date.now(), egress })
     availability.flush()
-    // The auto route's membership is the probe's verdict: recompose the catalog
-    // now, so a model this round dropped (or regained) leaves (or rejoins) the
-    // chain without waiting for the next listing round.
-    rebuildCatalog()
     const verdicts = Object.values(results)
-    if (verdicts.length > 0 && verdicts.every(row => row.state === STATE.unavailable)) {
-      logger.warn?.(`our-free-model: the gateway refused all ${verdicts.length} models this round (${verdicts[0].detail ?? 'no detail'}); keeping them advertised`)
-    }
     const allThrottled = verdicts.length > 0 && verdicts.every(row => row.state === STATE.throttled)
-    probeThrottleStreak = allThrottled ? probeThrottleStreak + 1 : 0
-    probeBackoffUntil = allThrottled
-      ? Date.now() + Math.min(30 * 2 ** (probeThrottleStreak - 1), 120) * 60_000
-      : 0
     if (allThrottled) {
-      logger.warn?.(`our-free-model: the probe round hit the lane's quota; availability probes pause for ${Math.round((probeBackoffUntil - Date.now()) / 60_000)} minutes (your own requests are unaffected, and the reprobe button forces a round)`)
+      probeBackoffUntil = Date.now() + 30 * 60_000
+      logger.warn?.('our-free-model: the manual probe hit the lane quota; the breaker now carries the window')
+    } else {
+      probeBackoffUntil = 0
     }
     emitTopology()
     return results
   }
-  async function refreshAvailability(force = false) {
-    if (disposed || (!force && probeBackoffUntil > Date.now())) return {}
-    if (probeRound !== null) return probeRound
-    const round = runProbeRound()
+  async function refreshAvailability(force = false, { model } = {}) {
+    if (disposed) return {}
+    if (!force && probeBackoffUntil > Date.now()) return {}
+    const gate = laneGate()
+    if (!gate.ok) return { skipped: gate.state, retryAt: gate.retryAt, message: gate.message }
+    if (probeRound !== null && probeRoundGeneration === egressGeneration) return probeRound
+    probeRoundGeneration = egressGeneration
+    const round = runProbeRound(model)
     probeRound = round
     try { return await round } finally { if (probeRound === round) probeRound = null }
   }
@@ -323,51 +523,115 @@ export function createModelRuntime({
       || previous.ip !== seen.ip || (seen.country !== undefined && previous.country !== seen.country)
     egress = seen
     if (changed) {
-      availability.update({ egress: seen })
+      egressGeneration++
+      // 保留历史记录，但旧出口的成功、拒绝和手动测量均不能代表新出口。
+      const expire = rows => Object.fromEntries(Object.entries(rows ?? {}).map(([id, row]) => [id, { ...row, stale: true }]))
+      availability.edit(value => ({
+        ...value, egress: seen, at: 0,
+        results: expire(value.results), manualResults: expire(value.manualResults),
+        lane: { state: 'ok', at: Date.now() },
+      }))
       availability.flush()
-      logger.info?.(`our-free-model: egress changed to ${seen.ip}${seen.country ? ` (${seen.country})` : ''}; re-probing availability`)
-      await refreshAvailability(true)
+      probeBackoffUntil = 0
+      emitTopology()
+      // 出口变更即换桶：额度断路器与客户端锁随旧出口一起失效（issue #708 的
+      // 换出口思路），但这是用户显式改出口触发的，一次出口变更只清一次。
+      // 只使旧判定失效并通知选择器，不发送任何自动探测请求。
+      logger.info?.(`our-free-model: egress changed to ${seen.ip}${seen.country ? ` (${seen.country})` : ''}; previous availability marked stale`)
     }
     return true
   }
 
+  const latestTests = new Map()
+  async function testModel(id, effort = DEFAULT_LEVEL, { signal } = {}) {
+    if (disposed) throw new UpstreamError('Model runtime stopped', CODE.aborted)
+    if (settings.get().enabled === false) throw new UpstreamError('Inference is paused', CODE.client)
+    const entry = catalog.find(candidate => candidate.id === id)
+    if (!entry) throw new UpstreamError('Unknown model "' + id + '"', CODE.client, { status: 404 })
+    const token = {}
+    latestTests.set(id, token)
+    const generation = egressGeneration
+    const selectedEffort = effort === undefined || effort === '' ? DEFAULT_LEVEL : effort
+    const linkedSignal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal
+    const persist = row => {
+      if (disposed || linkedSignal.aborted || latestTests.get(id) !== token || generation !== egressGeneration) return false
+      availability.edit(value => ({ ...value, manualResults: { ...value.manualResults, [id]: row } }))
+      availability.flush()
+      emitTopology()
+      return !availability.writeFailed
+    }
+    try {
+      const measured = await runModelTest(testSignal => adapter.stream({
+        provider: ROUTE_MAIN, model: entry.id,
+        messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
+        reasoningEffort: selectedEffort, sessionId: 'bench:' + entry.id + ':' + selectedEffort,
+        signal: testSignal,
+      }, entry, state()), { signal: linkedSignal })
+      if (linkedSignal.aborted || disposed) throw new UpstreamError('Text test cancelled', CODE.aborted)
+      if (generation !== egressGeneration) throw new UpstreamError('Network egress changed during the text test; please test again', CODE.aborted)
+      const persisted = persist({ state: STATE.available, source: 'manual', at: Date.now(), ttftMs: measured.ttftMs, latencyMs: measured.totalMs })
+      return { model: entry.id, effort: selectedEffort, ok: true, ...measured, persisted }
+    } catch (error) {
+      // Cancellation is a user action, not a fresh availability verdict. Other failures
+      // remain unknown instead of silently banning a paid/region-gated route.
+      if (error?.code !== CODE.aborted) persist({ state: STATE.unknown, source: 'manual', at: Date.now(), detail: String(error?.message ?? error).slice(0, 200) })
+      throw error
+    } finally {
+      if (latestTests.get(id) === token) latestTests.delete(id)
+    }
+  }
+
   return {
-    state, adapter, refreshCatalog, refreshSealedLane, refreshAvailability, watchEgress, fetchListing,
+    testModel, state, adapter, refreshCatalog, refreshSealedLane, refreshAvailability, watchEgress, fetchListing,
+    laneGate, clearLaneBreaker,
+    complete: createForwardCompletion({
+      adapter, signal: lifetime.signal,
+      state: () => {
+        const snapshot = state()
+        // Hiding advertisements must not invalidate requests using a saved id.
+        const forwardSettings = {
+          ...snapshot.settings, hiddenModelIds: [], hideFreeModels: false, hideEacModels: false,
+        }
+        return { ...snapshot, membership: computeMembership(snapshot.catalog, availability.get(), forwardSettings,
+          buildModelVisibility(forwardSettings, snapshot.visibility.familyKeysById)) }
+      },
+    }),
+    publicModelRows: () => publicModelRows(state()),
     // The built-in aggregate route as the routing page sees it. Its switch
-    // lives in settings and its membership in the probe verdicts, so its row
-    // exists in the catalog only while the switch is on — the descriptor
-    // reports the serving chain when it is live and the would-be members when
-    // it is off, and the chain editor never owns this row either way.
+    // lives in settings and its links in the latest verdicts, so the row
+    // exists in the view only while the switch is on and the chain is
+    // non-empty — the descriptor reports the serving chain when it is live
+    // and the would-be members when it is off or empty, and the chain editor
+    // never owns this row either way.
     autoRoute() {
       if (disposed) return null
-      // The switch reads first: between a settings write and the next rebuild
-      // the catalog can still carry a row the switch just retired (or lack one
-      // it just asked for), and the stale row must not outvote the setting.
       const enabled = settings.get().autoChain !== false
-      const row = enabled ? catalog.find(entry => entry.auto === true) : undefined
+      const row = state().catalog.find(entry => entry.auto === true)
       if (row !== undefined) {
         return { id: AUTO_ENTRY_ID, name: row.name ?? AUTO_ENTRY_ID, enabled: true, models: row.combo ?? [], lanes: row.lanes ?? [] }
       }
-      const real = catalog.filter(entry => entry.auto !== true && !isComboEntry(entry))
-      const members = autoMembers(real, availability.get(), settings.get())
+      const links = autoLinks(computeMembership(catalog, availability.get(), settings.get()), catalog)
       return {
         id: AUTO_ENTRY_ID,
         name: AUTO_ENTRY_ID,
         enabled,
-        models: members.map(entry => entry.id),
-        lanes: [...new Set(members.map(entry => entry.channel ?? 'free'))],
+        models: links.map(entry => entry.id),
+        lanes: [...new Set(links.flatMap(entry => entry.lanes ?? [entry.channel ?? 'free']))],
       }
     },
-    complete: createForwardCompletion({ adapter, state, signal: lifetime.signal }),
-    publicModelRows: () => publicModelRows(state()),
     // A settings write that changes the aggregate lane or the chains (a key
-    // saved, a provider switched off, a combo edited) rebuilds the merged view
-    // without a listing round: the aggregate rows come from settings alone.
+    // saved, a subscription imported/toggled/removed, a combo edited) rebuilds
+    // the merged view without an upstream listing round.
     syncAggregateCatalog() {
       if (disposed) return catalog
       mergeCatalogs()
       emitTopology()
       return catalog
+    },
+    // An extension install/enable/disable/uninstall lands here: the extension
+    // runtime has already rebuilt its own rows, so this is a merge + announce.
+    syncExtensionCatalog() {
+      return this.syncAggregateCatalog()
     },
     get catalog() { return catalog },
     get egress() { return egress },
@@ -377,7 +641,6 @@ export function createModelRuntime({
       if (disposed) return
       disposed = true
       lifetime.abort()
-      clearTimeout(reprobeTimer)
     },
   }
 }
@@ -387,10 +650,10 @@ function materializeCatalog(ids) {
   return rebuilt.length > 0 ? rebuilt : FALLBACK_CATALOG
 }
 
-export function computeMembership(catalog, availabilitySnapshot, settings) {
-  const results = availabilitySnapshot?.results ?? {}
+export function computeMembership(catalog, availabilitySnapshot, settings, visibility) {
+  const visibilityIndex = visibility ?? buildModelVisibility(settings, catalogFamilyKeys(catalog))
   const expose = settings?.exposeRegionModels !== false
-  const verdictOf = entry => results[entry.id]?.state
+  const verdictOf = entry => modelAvailability(entry.id, availabilitySnapshot, Boolean(entry.channel)).availability
   const probeable = catalog.filter(entry => !entry.channel)
   const refusedAll = probeable.length > 0 && probeable.every(entry => verdictOf(entry) === STATE.unavailable)
   let usable = catalog.filter(entry => verdictOf(entry) !== STATE.unavailable)
@@ -398,6 +661,7 @@ export function computeMembership(catalog, availabilitySnapshot, settings) {
   const main = []
   const region = []
   for (const entry of usable) {
+    if (isModelHidden(entry, settings, visibilityIndex)) continue
     const verdict = verdictOf(entry)
     if (verdict !== STATE.regionBlocked) main.push(entry.id)
     else if (expose) region.push(entry.id)
@@ -409,15 +673,20 @@ export function computeMembership(catalog, availabilitySnapshot, settings) {
 }
 
 /**
- * The auto route's links: every real model the membership verdict calls
- * dialable on the current egress, in catalog order.
- *
- * A model that probed unavailable or region-blocked sits the turn out; one
- * with no verdict yet — never probed, or an absorbed lane with no probe of its
- * own — is dialable as advertised, which is the same rule the picker follows.
+ * The real rows the current membership calls dialable, in catalog order —
+ * the auto route's candidate links. Chains and the paid lanes are never
+ * links: a chain inside the auto chain would be a loop the user cannot see,
+ * and an automatic route must not silently spend an aggregate provider or a
+ * subscription credential the user configured for their own traffic.
  */
-function autoMembers(realCatalog, availabilitySnapshot, settings) {
-  const membership = computeMembership(realCatalog, availabilitySnapshot, settings)
-  const byId = new Map(realCatalog.map(entry => [entry.id, entry]))
-  return (membership[ROUTE_MAIN] ?? []).map(id => byId.get(id)).filter(entry => entry !== undefined)
+function autoLinks(membership, rows) {
+  const dialable = new Set([...(membership[ROUTE_MAIN] ?? []), ...(membership[ROUTE_REGION] ?? [])])
+  return rows.filter(entry => dialable.has(entry.id) && !isComboEntry(entry)
+    && !isAggregateEntry(entry) && !isSubscriptionEntry(entry))
+}
+
+/** Append the composed auto row (or drop a retired one) as the view's last row. */
+function withAutoRoute(rows, rebuilt) {
+  const without = rows.filter(entry => entry.auto !== true)
+  return rebuilt === null ? without : [...without, rebuilt]
 }

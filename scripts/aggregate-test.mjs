@@ -69,7 +69,6 @@ const catalogConfig = {
   providers: {
     cerebras: { enabled: true, apiKey: 'k-cerebras' },
     groq: { enabled: true },
-    opencode: { enabled: true },
     ollama: { enabled: true, models: ['llama3.2:1b'] },
     openai: { enabled: true, apiKey: 'k-openai' },
     'not-a-provider': { enabled: true, apiKey: 'k' },
@@ -90,7 +89,6 @@ const row = id => rows.find(entry => entry.id === id)
 check('an enabled apiKey provider with a key contributes its registry models',
   ids.includes('cerebras/gpt-oss-120b') && ids.includes('cerebras/llama-3.3-70b'), true)
 check('an enabled apiKey provider with no key is skipped', ids.some(id => id.startsWith('groq/')), false)
-check('a keyless provider needs no key', ids.includes('opencode/union-alpha'), true)
 check('a local provider needs no key', ids.filter(id => id.startsWith('ollama/')), ['ollama/llama3.2:1b'])
 check('an unknown provider id is skipped', ids.some(id => id.startsWith('not-a-provider/')), false)
 check('a disabled provider is skipped', ids.some(id => id.startsWith('deepseek/')), false)
@@ -174,9 +172,11 @@ const overridden = resolveProvider({ providers: { cerebras: { enabled: true, api
 check('a base URL override moves the turn and the listing with it',
   [overridden.baseUrl, overridden.chatUrl, overridden.modelsUrl],
   ['http://127.0.0.1:9/cerebras', 'http://127.0.0.1:9/cerebras/chat/completions', 'http://127.0.0.1:9/cerebras/models'])
-const keyless = resolveProvider({ providers: { opencode: { enabled: true } } }, 'opencode')
-check('a keyless provider resolves with no credential and its declared headers',
-  [keyless.apiKey, keyless.headers.authorization, keyless.headers['x-opencode-client']], ['', undefined, 'desktop'])
+// A keyless row resolves with no per-user credential at all: `apiKey` stays
+// empty and no bearer is invented, which is what the local rows require.
+const keyless = resolveProvider({ providers: { ollama: { enabled: true, models: ['llama3.2:1b'] } } }, 'ollama')
+check('a keyless provider resolves with no credential of its own',
+  [keyless.apiKey, keyless.headers.authorization, keyless.headers['x-api-key']], ['', undefined, undefined])
 const claude = resolveProvider({ providers: { anthropic: { enabled: true, apiKey: 'sk-ant' } } }, 'anthropic')
 check('an Anthropic row resolves to x-api-key plus the version header',
   [claude.chatUrl, claude.headers['x-api-key'], claude.headers.authorization, claude.headers['anthropic-version'], claude.wire, claude.modelsUrl],
@@ -483,6 +483,48 @@ await checkAsync('a 429 is a rate-limit failure with the retry hint', async () =
   assert.equal(failure?.code, 'RATE_LIMIT')
   assert.equal(failure?.status, 429)
   assert.equal(failure?.providerRetryAfterMs, 2000)
+})
+
+await checkAsync('a 200 JSON refusal is classified by its error type, not retried as SERVER', async () => {
+  script = (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: { message: 'fixture refusal', type: 'invalid_request_error' } }))
+  }
+  let failure
+  try {
+    await postAggregateStreamed({
+      config: liveConfig, providerId: 'cerebras', modelId: 'gpt-oss-120b',
+      body: { model: 'gpt-oss-120b', messages: [{ role: 'user', content: 'hi' }] },
+      onData: () => {},
+    })
+  } catch (error) { failure = error }
+  assert.equal(failure?.code, 'CLIENT_ERROR')
+  assert.equal(failure?.status, 200)
+})
+
+await checkAsync('a 200 refusal keeps dedicated judgements ahead of the generic type', async () => {
+  const cases = [
+    { type: 'invalid_request_error', message: 'Model is unavailable.', code: 'SERVER', unavailable: true },
+    { type: 'rate_limit_error', message: "OpenCode's free tier can only be used from within OpenCode.", code: 'LANE_LOCKED' },
+    { type: 'rate_limit_error', message: '需要 GitHub 授权，请先登录', reason: 'missing', code: 'AUTHORIZATION_REQUIRED' },
+  ]
+  for (const fixture of cases) {
+    script = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { type: fixture.type, message: fixture.message, ...(fixture.reason ? { reason: fixture.reason } : {}) } }))
+    }
+    let failure
+    try {
+      await postAggregateStreamed({
+        config: liveConfig, providerId: 'cerebras', modelId: 'gpt-oss-120b',
+        body: { model: 'gpt-oss-120b', messages: [{ role: 'user', content: 'hi' }] },
+        onData: () => {},
+      })
+    } catch (error) { failure = error }
+    assert.equal(failure?.code, fixture.code, `${fixture.type} + ${fixture.message}`)
+    if (fixture.unavailable !== undefined) assert.equal(failure?.unavailable, fixture.unavailable)
+    if (fixture.reason !== undefined) assert.equal(failure?.reason, fixture.reason)
+  }
 })
 
 await checkAsync('an HTML 200 body is the front proxy speaking, not a retryable fault', async () => {

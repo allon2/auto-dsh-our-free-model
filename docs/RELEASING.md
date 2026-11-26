@@ -25,6 +25,7 @@
   "createdAt": "2026-10-01T00:00:00Z",
   "expiresAt": "2026-10-15T00:00:00Z", // 可选，过期自动消失
   "link": { "url": "https://…", "label": "查看详情" },  // 可选
+  "holdSeconds": 3,                   // 可选：urgent 弹层的关闭锁，0-30 秒倒数后才允许关闭
   "html": "<p>正文，<strong>支持受限白名单的 HTML</strong></p>"
 }
 ```
@@ -38,7 +39,8 @@
 改完代码后——
 
 ```bash
-# 1. 修改 package.json 的 version 与 feed/announcements.json（版本说明）
+# 1. 修改 package.json 的 version、两份 README 的本地 tarball 安装版本号
+#    （catalog 套件校验文件名版本）与 feed/announcements.json（版本说明）
 # 2. 重新生成清单（把每个发布文件的字节数与 SHA-256 写进 feed/manifest.json；
 #    同一份文件清单也会写进 catalog/integrity.json，供生态目录审计用）
 node scripts/build-manifest.mjs --key /安全目录/既有发布私钥.pem
@@ -69,6 +71,36 @@ node scripts/live-audit.mjs          # 打印 OK 才算发出去；FAIL 就按�
 已安装的插件会按 `updateCheckHours`（默认 6 小时）自动发现新版本并推送通知；
 用户确认后下载、校验、备份、替换、热重载全部在应用内完成。清单会校验每个文件的
 SHA-256，并在安装前重新拉取一次，避免用陈旧清单校验新文件。
+
+## npm 渠道：scoped 产物必须由脚本改名（issue #725 / #835）
+
+仓库树是裸包（`dsh-our-free-model`，`private: true`）：应用内升级器下载的就是这份
+裸名字节，`client-lint` 与 `catalog` 套件也按裸名钉死，所以树本身不许改成 scoped。
+npm 渠道发布的是同一份已审树在 `@ebony-vinyl/` scope 下的**改名产物**。
+
+改名必须走 `node scripts/publish-scoped.mjs --out <目录>`，不要手工复制后改
+`package.json`：产物里有三处「包自称」的注册字面量必须跟着新名字走，漏掉任何一处
+都会让用户装到半改名的包——2.7.4 到 2.8.5 每一版都是这么坏的（#725 / #835 / #796 /
+#797 / #785 / #779 / #773：桌面端启动报 `1 entry did not activate` 与
+`duplicate factory registration`，设置页里根本看不到本插件）：
+
+| 文件 | 字面量 | 作用 |
+| --- | --- | --- |
+| `client.js` | `id: '<包名>',` | 浏览器半身的工厂注册 id |
+| `cordis.patch.yml` | `name: '<包名>'` | Host 半身的 loader 挂载行 |
+| `src/updater.js` | `const PACKAGE_NAME = '<包名>'` | pnpm 托管安装的所有权探测键 |
+
+第三处最隐蔽：scoped 安装被 pnpm 记在 scoped 键下，裸常量让
+`isPackageManagerOwned` 永远探测不到托管安装，应用内升级器就会在包管理器的头顶
+改写安装目录。脚本只改这三处注册字面量与 `package.json` 的 `name`/`private`/
+`publishConfig.access`；User-Agent 与 `data-plugin` 等其余裸名拼写是线上身份或
+装饰属性，**刻意不改**。`--check` 模式不落盘，只做一致性断言，已接进测试套件
+（`scoped-publish`）。发布 npm 渠道时：
+
+```bash
+node scripts/publish-scoped.mjs --out /临时目录/scoped
+npm publish /临时目录/scoped --access public   # 或把该目录打成 tarball 附进 Release
+```
 
 ## main 上的发布一致性是强制的（ruleset）
 
@@ -108,8 +140,8 @@ revision 再提交，HEAD 又前移——逻辑上无解。改比"最近一次�
 
 ## 固定提交取件与旧客户端过渡（issue #120）
 
-新版升级器将默认更新 URL 用于发现版本；实际下载前通过 GitHub 官方
-`/repos/Ebony-Vinyl/dsh-our-free-model/commits/<ref>` 解析完整 40 位 commit SHA，
+新版升级器将默认更新 URL 用于发现版本；实际下载前依次通过 GitHub 官方
+commits API、git upload-pack refs 和 commits Atom feed 解析完整 40 位 commit SHA，
 再从 `raw.githubusercontent.com/<repo>/<sha>/feed/manifest.json` 或
 `cdn.jsdelivr.net/gh/<repo>@<sha>/feed/manifest.json` 下载签名清单。
 清单的相对 `base` 从这个固定 URL 解析，全部文件因此来自同一提交。
@@ -117,8 +149,8 @@ raw 取件失败转 CDN 时复用本次已解析的 SHA；点击升级会重新�
 
 现有公钥、清单字段和签名格式保持兼容；解析接口仅提供下载位置，不授权代码。
 清单验签、文件大小与 SHA-256、暂存回读及回滚照常执行。解析失败、限流或超时会报错，
-不退回可变分支取件。每个镜像的一次解析及清单读取共用 15 秒预算；每次检查、应用升级
-需要 GitHub API 可达且有公开接口配额。固定 SHA 的 `--source` 和本地测试源无需该接口。
+不退回可变分支取件。每个镜像的一次解析及清单读取共用 15 秒预算；单个解析端点最多
+占用 3 秒，API 限流时仍可尝试 refs 和 Atom。固定 SHA 的 `--source` 和本地测试源无需解析。
 
 固定 SHA 的主 jsDelivr 文件取件遇到连接失败、重定向、404、429 或 5xx 时，
 可切换至 `gcore.jsdelivr.net` 的同一 SHA 和路径，两次取件共用单次超时预算。
@@ -136,7 +168,7 @@ raw 取件失败转 CDN 时复用本次已解析的 SHA；点击升级会重新�
 
 ## 关于源顺序与网络现实
 
-发现源的顺序是 `raw.githubusercontent(main) → jsDelivr(@main) → raw(master)`。
+发现源的顺序是 `raw.githubusercontent(main) → jsDelivr(@main) → gcore jsDelivr(@main) → gh-proxy(main)`。
 新版升级器先固定提交再取件，全部失败时报错并保留现有安装；公告仍使用原有缓存回退。
 以 `src/feed.js` 与 `src/updater.js` 的 `DEFAULT_*_SOURCES` 数组及下载实现为准。
 
@@ -268,6 +300,43 @@ Installed plugins discover the new release automatically (every
 in-app, and the manifest is re-fetched right before installing so a document
 fetched hours earlier cannot be used to vouch for bytes that changed since.
 
+## The npm channel: the scoped artifact must be renamed by the script (#725 / #835)
+
+The repository tree is the bare package (`dsh-our-free-model`, `private: true`):
+the in-app upgrader ships exactly these bare bytes, and `client-lint` and the
+catalog suite pin the bare name, so the tree itself must never be scoped. The
+npm channel publishes a **renamed artifact** of the same reviewed tree under the
+`@ebony-vinyl/` scope.
+
+Produce it with `node scripts/publish-scoped.mjs --out <dir>` — never by copying
+files and hand-editing `package.json`. Three "package names itself" registration
+literals must follow the new name, and a half-renamed artifact bricks every
+desktop install that takes it (that is how every version from 2.7.4 through
+2.8.5 shipped broken — #725 / #835 / #796 / #797 / #785 / #779 / #773: boot died
+with `1 entry did not activate` and `duplicate factory registration`, and the
+plugin never appeared in settings):
+
+| File | Literal | Role |
+| --- | --- | --- |
+| `client.js` | `id: '<pkg>',` | the browser half's factory registration id |
+| `cordis.patch.yml` | `name: '<pkg>'` | the host half's loader mount row |
+| `src/updater.js` | `const PACKAGE_NAME = '<pkg>'` | the pnpm-ownership probe key |
+
+The third is the subtle one: a scoped install is recorded under the scoped key,
+so the bare constant makes `isPackageManagerOwned` blind to package-manager-
+owned installs, and the in-app updater then rewrites the directory out from
+under the pack that owns it. The script renames exactly these three literals
+plus `package.json`'s `name`/`private`/`publishConfig.access`; every other bare
+spelling — the request User-Agent, the cosmetic `data-plugin` attribute — is
+wire identity or decoration and **deliberately untouched**. `--check` asserts
+both trees stay self-consistent without writing, and runs in the test suite as
+`scoped-publish`. To publish the npm channel:
+
+```bash
+node scripts/publish-scoped.mjs --out /tmp/scoped
+npm publish /tmp/scoped --access public   # or attach that directory as a tarball to a Release
+```
+
 ## Release consistency on main is enforced (ruleset)
 
 **Pushing is publishing**, so "edited a released file but skipped the manifest
@@ -316,17 +385,18 @@ artifact bytes — but HEAD sits at all-green there).
 
 ## Immutable downloads and migration from old clients (issue #120)
 
-The updater resolves each official discovery ref through GitHub's commits API
+The updater resolves each official discovery ref through GitHub's commits API,
+git upload-pack refs, then the commits Atom feed
 before downloading its signed manifest. It returns the SHA-based manifest URL;
 all file URLs resolve relative to that snapshot. A raw-to-CDN fallback reuses
 the same SHA within a check. Apply performs a fresh check. The resolver only
 selects a location: the existing Ed25519 signature and every file's size/hash
 remain mandatory. The manifest format and pinned public key do not change.
 
-Resolution and manifest reading share a 15-second budget per source. If GitHub
-API resolution fails, is rate limited or times out, the update fails without
-falling back to mutable refs. Updates now require public GitHub API access and
-quota; explicit full-SHA URLs and custom/local test sources need no resolver.
+Resolution and manifest reading share a 15-second budget per source. Each resolver
+has at most three seconds, so an API rate limit or timeout can fall back to refs
+and Atom. If all resolvers fail, the update fails without using mutable refs.
+Explicit full-SHA URLs and custom/local test sources need no resolver.
 
 Installed old clients still fetch mutable refs. Purge the current publication
 and verify all files with an old updater before relying on that migration.
@@ -342,7 +412,7 @@ not trigger this fallback. Mutable and custom file sources are not remapped.
 
 ## Source order and network reality
 
-Discovery order is `raw.githubusercontent(main) → jsDelivr(@main) → raw(master)`.
+Discovery order is `raw.githubusercontent(main) → jsDelivr(@main) → gcore jsDelivr(@main) → gh-proxy(main)`.
 The new updater pins a commit before downloading; on failure it reports the
 error and retains the installation. Announcements retain their existing cache
 fallback. Consult the source arrays and download implementation in `src/feed.js`

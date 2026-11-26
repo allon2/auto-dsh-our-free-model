@@ -42,12 +42,6 @@
  *
  * ## ⚠ configurable provider 声明已**刻意停用**（2026-10-01，用户要求）
  *
- * **现象**：「设置 → 模型 → 提供商」里常驻十二行本插件的 provider（codearts /
- * buddy / workbuddy / lobsterai / qoder / qodercn / trae / cline / loomy /
- * raccoon / minimax / zcode），每行都带 API 密钥、baseURL 与模型目录编辑框，
- * 但这些对本插件**没有意义** —— 凭据由 Channel Pack 账号池 + `ctx.credentials` 注入，
- * 模型开关与模型目录也都在 Channel Pack 设置页管理。
- *
  * **机制**（依据 `dsh-client-ui-settings-models` 的产物源码）：
  * - 该页的行**只**来自 `ctx.llm.registerConfigurableProviders()` 声明的目录
  *   （`joinProviderDirectory()`：声明过的进目录行，未声明的存活路由只进模型选择器）；
@@ -72,7 +66,22 @@
  */
 
 import { withDeadModelPruning } from './dead-model-store.js'
-import { FALLBACK_IMAGE_PRICING } from '../../../src/image-pricing.js'
+
+/**
+ * 缺少厂商视觉计价协议时的同步估算。
+ *
+ * 与宿主 `src/adapter.js` 的同名常量保持一致；渠道包不能从那里 import ——
+ * 那会把 adapter、aggregate、providers 和整个宿主依赖图一起打进 `pack.js`，
+ * 而这里只需要一个十行的兜底对象。
+ */
+const FALLBACK_IMAGE_PRICING = Object.freeze({
+  /** @param {readonly { offloaded?: boolean }[]} images */
+  priceImages(images: readonly { offloaded?: boolean }[]) {
+    return images.map(image => image.offloaded === true
+      ? { visualTokens: 0, text: '[image omitted]' }
+      : { visualTokens: 1024, text: '[image]' })
+  },
+})
 
 /** dsh-llm 对「configurable provider 已存在」抛的 code。**当前仅作防御**保留。 */
 const DUPLICATE_DIRECTORY = 'DUPLICATE_DIRECTORY'

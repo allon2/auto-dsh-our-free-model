@@ -36,6 +36,12 @@ export const CODE = {
   // a refusal neither wipes the cached roster nor sends anyone chasing a
   // re-install; the settings page answers it with a login prompt instead.
   authorization: 'AUTHORIZATION_REQUIRED',
+  // The free lane's client gate: the gateway judged *this client* and refused
+  // the whole lane (403 FreeTierError). Not a credential, not a model, not
+  // retryable — a refusal this install cannot retry away.
+  laneLocked: 'LANE_LOCKED',
+  permission: 'PERMISSION_DENIED',
+  exhausted: 'QUOTA_EXHAUSTED',
   transport: 'TRANSPORT',
   timeout: 'TIMEOUT',
   server: 'SERVER',
@@ -98,10 +104,19 @@ export function classifyFailure(status, payload, retryAfterMs) {
     ? `the gateway's front proxy answered HTTP ${status} with an HTML error page — usually a WAF or body-size limit in front of the gateway, not your credentials; if this hit a long conversation, its request size is the likely trigger`
     : raw
   const flat = message.toLowerCase()
+  // A refusal delivered inside a 2xx body or an in-stream `error` frame has no
+  // HTTP status to classify by: the envelope's own `type` is the only
+  // machine-readable discriminator left. Statuses that already speak keep
+  // their branches below — 401/403, the 408/425 carve-out, ModelError — so the
+  // type mapping is deliberately limited to a status that carries no verdict.
+  const statusCarriesNoVerdict = status === undefined || status === null || (status >= 200 && status < 300)
   if (type === 'RegionError' || /not available in your country|region/i.test(flat)) {
     return new UpstreamError(message, CODE.region, { status, type })
   }
-  if (status === 429 || type === 'FreeUsageLimitError' || /usage limit|rate limit/i.test(flat)) {
+  if (type !== 'permission_error' && (type === 'insufficient_quota' || error.code === 'insufficient_quota')) {
+    return new UpstreamError(message, CODE.exhausted, { status, type })
+  }
+  if (type !== 'permission_error' && (status === 429 || type === 'FreeUsageLimitError' || /usage limit|rate limit/i.test(flat))) {
     return new UpstreamError(message, CODE.quota, { status, type, providerRetryAfterMs: retryAfterMs })
   }
   // The gateway rejects a signature only when the bytes it received differ from
@@ -124,12 +139,40 @@ export function classifyFailure(status, payload, retryAfterMs) {
   if (type === 'AuthorizationRequired' || /需要 GitHub 授权|GitHub 授权无效/.test(raw)) {
     return new UpstreamError(message, CODE.authorization, { status, type, reason: typeof error.reason === 'string' ? error.reason : '' })
   }
+  // The free lane's client gate (issue #310): 403 FreeTierError — "OpenCode's
+  // free tier can only be used from within OpenCode" — names the client, not
+  // the credential or the model. The stock classifier filed it as
+  // INVALID_CREDENTIAL, which wiped the cached roster and sent users chasing
+  // a re-login that cannot help: the upstream refuses this client's fingerprint
+  // and no credential change alters that. Its own code keeps it out of both
+  // the credential branch and the generic 4xx fallthrough, and the availability
+  // probe reads it as a lane-level lock (src/probe.js) instead of leaving the
+  // model in the picker as "unknown".
+  if (type === 'FreeTierError' || /free tier can only be used from within/i.test(flat)) {
+    return new UpstreamError(message, CODE.laneLocked, { status, type })
+  }
+  if (type === 'permission_error') return new UpstreamError(message, CODE.permission, { status, type })
   // An HTML page at 401/403 is the front proxy speaking, not the credential
   // store: fall through to the 4xx branch so users are not sent re-logging for
   // a WAF refusal.
   if (status === 401 || status === 403) return new UpstreamError(message, isHtmlPage ? CODE.client : CODE.credential, { status, type })
   if (type === 'ModelError' || /model is unavailable|not supported/.test(flat)) {
     return new UpstreamError(message, CODE.server, { status, type, unavailable: true })
+  }
+  // Only after every dedicated type and description above has passed: a
+  // generic envelope type fills the gap when the status is 2xx or absent. A
+  // dead credential is not retryable, a refused request reproduces itself, and
+  // a spent bucket is a rate limit, so none may fall through to SERVER. The
+  // ordering also keeps a generic `type` from erasing the more specific
+  // reading of the message (model unavailable, free-tier lock, GitHub auth).
+  if (statusCarriesNoVerdict && type === 'rate_limit_error') {
+    return new UpstreamError(message, CODE.quota, { status, type, providerRetryAfterMs: retryAfterMs })
+  }
+  if (statusCarriesNoVerdict && type === 'authentication_error') {
+    return new UpstreamError(message, CODE.credential, { status, type })
+  }
+  if (statusCarriesNoVerdict && type === 'invalid_request_error') {
+    return new UpstreamError(message, CODE.client, { status, type })
   }
   // 4xx is the request's own fault: replaying the identical body reproduces the
   // identical refusal, so it stays outside the harness's retryable set — which
@@ -333,28 +376,76 @@ async function readRemainder(head, signal) {
  * @param {string} options.path - gateway path
  * @param {object} options.body - JSON request body
  * @param {string} options.session - canonical upstream session id
- * @param {string} options.requestId - per-turn request id
- * @param {string} [options.attributionUserAgent] - harness User-Agent merged into the request
+ * @param {string} [options.attributionUserAgent] - kept for the host API; this lane sends the v2 fingerprint UA instead
  * @param {AbortSignal} [options.signal]
  * @param {(payload: string) => void} options.onData - one `data:` payload, in order
  * @returns {Promise<{status:number, headers:Headers}>}
  */
 /**
- * Compose the request User-Agent.
+ * The User-Agent this lane sends.
  *
- * Two independent requirements meet in one header: the harness mandates an
- * attribution User-Agent on every provider request, and the gateway identifies a
- * desktop client by an `opencode/<version>` token (>= 1.17). The gateway tests
- * with a search rather than an anchored match, so one value can satisfy both —
- * verified live against this lane.
+ * ⚠️ v2 指纹（2026-10-14 起）要求这一串**原样单独**出现：形状
+ * `opencode/<channel>/<version>/<client>`、major ≥ 2，且按整串匹配。旧实现
+ * 「归属 UA + `opencode/1.18.x`」的拼接方式现在两处都会踩雷 —— v1 版本号被按名字
+ * 拒掉，任何前后缀又会让整串不再是 v2 客户端形状。
+ *
+ * ⇒ 本车道的 UA 就是官方那一串，归属信息不再随行；归属仍保留在其余车道
+ * （channel pack / EAC / Kilo 各自带自己的 UA）。`attributionUserAgent` 因此在本
+ * 车道上不再影响线上字节，参数保留是为了不动宿主 API 与调用方签名。
  */
-function userAgentWith(attribution) {
-  if (typeof attribution !== 'string' || attribution === '') return CLIENT_UA
-  return attribution.includes('opencode/') ? attribution : `${attribution} ${CLIENT_UA}`
+function userAgentWith(_attribution) {
+  return CLIENT_UA
 }
 
-export async function postStreamed({ path, body, session, requestId, attributionUserAgent, signal, onData, timeoutMs = 300000 }) {
-  const headers = gatewayHeaders({ session: truncateSession(session), requestId, stream: true })
+/**
+ * Whether a request body carries image parts.
+ *
+ * The free lane's gateway answers a share of image requests with a bare 5xx and
+ * an empty body, so the status says nothing about the cause. The image content
+ * is then the one fact the caller can act on (issue #549).
+ *
+ * Matched on the `type` spelling rather than one dialect's field name, because
+ * the three wires this repo speaks disagree: OpenAI says `image_url`, the
+ * harness says `input_image`, Messages says `image`.
+ */
+export function carriesImageContent(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : []
+  for (const message of messages) {
+    if (!Array.isArray(message?.content)) continue
+    for (const part of message.content) {
+      if (typeof part?.type === 'string' && part.type.includes('image')) return true
+    }
+  }
+  return false
+}
+
+/**
+ * The failure an empty 5xx body deserves.
+ *
+ * `classifyFailure` turns an empty body into the message `HTTP 502`, which tells
+ * the caller nothing: a gateway hiccup and a refusal of this exact request read
+ * identically, and #549's image requests land here about half the time. Say what
+ * is known — the hop that failed, and that the request carried images — and keep
+ * the retryability a 5xx implies. A 4xx with an empty body keeps going through
+ * `classifyFailure`, which already reads the status correctly.
+ */
+function emptyBodyFailure(status, retryAfterMs, imageContent) {
+  const hint = imageContent
+    ? ' — this request carried image content, and the model behind the gateway may not accept vision input'
+    : ''
+  return new UpstreamError(
+    `the gateway answered HTTP ${status} with an empty body: the failure is upstream of the model, not in this request${hint}`,
+    CODE.server,
+    { status, emptyBody: true, ...(retryAfterMs === undefined ? {} : { providerRetryAfterMs: retryAfterMs }) })
+}
+
+export async function postStreamed({ path, body, session, attributionUserAgent, signal, onData, timeoutMs = 300000 }) {
+  // The Messages wire carries the 2.x client's beta header (o2a/headers.js);
+  // the path is the only wire signal this layer sees. The project id derives
+  // from the same canonical session, so one conversation's retries,
+  // continuations and refreshes share one upstream quota bucket (PR #757).
+  const canonical = truncateSession(session)
+  const headers = gatewayHeaders({ session: canonical, project: canonical, stream: true, anthropic: path.includes('/messages') })
   headers['user-agent'] = userAgentWith(attributionUserAgent)
   let response
   try {
@@ -364,12 +455,24 @@ export async function postStreamed({ path, body, session, requestId, attribution
     // `TimeoutError`/user Error rather than `AbortError` — testing the name alone
     // reported a cancelled turn as `TRANSPORT`, which is retryable.
     if (signal?.aborted === true || error?.name === 'AbortError') throw new UpstreamError('request aborted', CODE.aborted)
+    // A lane-configuration refusal (a missing Bun, an unusable proxy) is not an
+    // "upstream request failed": the sentence the lane wrote is already the
+    // actionable answer, so it ships unwrapped, with its flag intact for the
+    // surfaces that distinguish "fix your environment" from "upstream broke".
+    if (error?.laneConfig === true) {
+      throw new UpstreamError(String(error?.message ?? error), CODE.transport, { laneConfig: true })
+    }
     throw new UpstreamError(`our-free-model: upstream request failed: ${error?.message ?? error}${transportCause(error)}`, CODE.transport)
   }
 
   const setRetry = retryAfter(response.headers.get('retry-after'))
   if (!response.ok) {
     const text = await response.text().catch(() => '')
+    // An empty 5xx body is the case #549 is about: there is no envelope to
+    // classify, and `HTTP 502` is not an answer the caller can act on.
+    if (text.trim() === '' && response.status >= 500) {
+      throw emptyBodyFailure(response.status, setRetry, carriesImageContent(body))
+    }
     let payload
     try { payload = JSON.parse(text) } catch { payload = { error: { message: text.slice(0, 300) || `HTTP ${response.status}` } } }
     throw classifyFailure(response.status, payload, setRetry)
@@ -415,12 +518,23 @@ export async function postStreamed({ path, body, session, requestId, attribution
  */
 export async function readSse(source, onData, signal, timeoutMs = 300000) {
   const reader = typeof source?.getReader === 'function' ? source.getReader() : null
-  const iterator = reader ?? (typeof source?.[Symbol.asyncIterator] === 'function' ? source[Symbol.asyncIterator]() : source)
+  const iterator = reader === null ? (typeof source?.[Symbol.asyncIterator] === 'function' ? source[Symbol.asyncIterator]() : source) : null
   const decoder = new TextDecoder()
   let buffer = ''
+  let data = []
+  let rawJson = ''
   let deadline = Date.now() + timeoutMs
+  // Did this read carry anything a caller would call progress? A keepalive is a
+  // comment line (`: ping`), and SSE defines it as something to ignore — so it
+  // must not wind the idle clock. Before this witness existed, every read reset
+  // `deadline` unconditionally, so a gateway that pings every 10–15s kept a
+  // wedged, token-less turn alive indefinitely: the request never timed out, it
+  // just held a connection until the gateway itself gave up (#460). The witness
+  // is deliberately wider than "onData fired" — a large raw-JSON body or a
+  // multi-line event can spend several reads accumulating before anything is
+  // dispatched, and those reads are real progress.
+  let content = false
   let stopped = false
-  const hasSignal = signal !== undefined && signal !== null
   const stop = () => {
     if (stopped) return
     stopped = true
@@ -435,23 +549,70 @@ export async function readSse(source, onData, signal, timeoutMs = 300000) {
   // abort so a held response cannot keep the adapter waiting.
   const next = async () => {
     if (signal?.aborted) throw new UpstreamError('request aborted', CODE.aborted)
-    let onAbort
+    let onAbort, timer
     const halted = new Promise((_, reject) => {
       onAbort = () => {
         stop()
         reject(new UpstreamError('request aborted', CODE.aborted))
       }
       signal?.addEventListener('abort', onAbort, { once: true })
+      timer = setTimeout(() => {
+        stop()
+        reject(new UpstreamError('our-free-model: upstream stream idle past its deadline', CODE.timeout))
+      }, Math.max(0, deadline - Date.now()))
     })
-    const pending = Promise.resolve().then(() => iterator.next())
+    const pending = Promise.resolve().then(() => reader !== null ? reader.read() : iterator.next())
     try {
-      return hasSignal ? await Promise.race([pending, halted]) : await pending
+      return await Promise.race([pending, halted])
     } finally {
       signal?.removeEventListener('abort', onAbort)
+      clearTimeout(timer)
       // The losing read settles after the source is cancelled; do not let its
       // rejection become an unhandled promise after the caller has returned.
       pending.catch(() => {})
     }
+  }
+  const dispatch = () => {
+    const payload = data.join('\n')
+    data = []
+    if (payload.trim() === '[DONE]') return true
+    if (payload !== '') {
+      onData(payload)
+      content = true
+    }
+    return false
+  }
+  const completeData = () => {
+    if (!data.length) return false
+    if (data.join('\n').trim() === '[DONE]') return true
+    try { JSON.parse(data.join('\n')); return true } catch { return false }
+  }
+  const line = value => {
+    const text = value.replace(/\r$/, '').replace(/^\uFEFF/, '')
+    if (rawJson || text.trimStart().startsWith('{')) {
+      if (!rawJson && dispatch()) return true
+      rawJson += (rawJson ? '\n' : '') + text
+      let payload
+      try { payload = JSON.parse(rawJson) } catch { return false }
+      rawJson = ''
+      if (payload?.error || payload?.type === 'error') throw classifyFailure(undefined, payload)
+      onData(JSON.stringify(payload))
+      content = true
+      return false
+    }
+    if (text === '') return dispatch()
+    if (text.startsWith(':')) return false
+    const colon = text.indexOf(':')
+    const field = colon < 0 ? text : text.slice(0, colon)
+    const valueText = colon < 0 ? '' : text.slice(colon + 1).replace(/^ /, '')
+    if (field === 'data') {
+      // Compatible endpoints may omit blank separators between complete JSON events.
+      if (completeData() && dispatch()) return true
+      if (valueText.trim() === '[DONE]') { dispatch(); return true }
+      if (valueText !== '') content = true
+      data.push(valueText)
+    }
+    return false
   }
   try {
     while (true) {
@@ -461,17 +622,28 @@ export async function readSse(source, onData, signal, timeoutMs = 300000) {
       if (value !== undefined) buffer += decoder.decode(value, { stream: true })
       let newline = buffer.indexOf('\n')
       while (newline !== -1) {
-        const line = buffer.slice(0, newline)
+        const row = buffer.slice(0, newline)
         buffer = buffer.slice(newline + 1)
-        emit(line, onData)
+        if (line(row)) return
         newline = buffer.indexOf('\n')
       }
-      deadline = Date.now() + timeoutMs
+      // A row still waiting for its newline counts as progress unless what has
+      // arrived so far is itself a comment: `: ping` split across two reads must
+      // not wind the clock, while a raw-JSON body or a half-arrived `data:` line
+      // must.
+      const pending = buffer.replace(/^\uFEFF/, '').replace(/\r$/, '')
+      if (pending.trim() !== '' && !pending.trimStart().startsWith(':')) content = true
+      if (content) {
+        content = false
+        deadline = Date.now() + timeoutMs
+      }
     }
     // Flush the decoder so a multi-byte character split over the last two chunks
     // is not silently dropped from the final payload.
     buffer += decoder.decode()
-    emit(buffer, onData)
+    if (buffer && line(buffer)) return
+    if (rawJson) throw new UpstreamError('upstream returned an incomplete JSON document inside its event stream', CODE.transport)
+    dispatch()
   } catch (error) {
     throw classifyStreamFailure(error, signal)
   } finally {
@@ -482,19 +654,10 @@ export async function readSse(source, onData, signal, timeoutMs = 300000) {
   }
 }
 
-function emit(line, onData) {
-  const text = line.trim()
-  if (text === '' || text.startsWith(':')) return
-  if (text.startsWith('data:')) {
-    const payload = text.slice(5).trim()
-    if (payload === '' || payload === '[DONE]') return
-    onData(payload)
-  }
-}
-
 /** Fetch a small JSON document from the gateway with the fingerprint headers. */
-export async function getJson(path, { session, requestId, attributionUserAgent, signal, timeoutMs = 15000 } = {}) {
-  const headers = gatewayHeaders({ session: truncateSession(session ?? ''), requestId: requestId ?? '', stream: false, accept: 'application/json' })
+export async function getJson(path, { session, attributionUserAgent, signal, timeoutMs = 15000 } = {}) {
+  const canonical = truncateSession(session ?? '')
+  const headers = gatewayHeaders({ session: canonical, project: canonical, stream: false, accept: 'application/json' })
   headers['user-agent'] = userAgentWith(attributionUserAgent)
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -519,5 +682,45 @@ export async function getJson(path, { session, requestId, attributionUserAgent, 
   } finally {
     clearTimeout(timer)
     signal?.removeEventListener?.('abort', onCallerAbort)
+  }
+}
+
+/** Preserve classified failures across the three local forwarding protocols. */
+export function carryFailure(failure, kind = 'error') {
+  const source = failure && typeof failure === 'object' ? failure : {}
+  const code = kind === 'aborted' ? 'ABORTED' : source.code
+  const status = source.status ?? source.statusCode
+  return {
+    message: typeof source.message === 'string' && source.message ? source.message : kind === 'aborted' ? 'request aborted' : 'our free model failed the turn',
+    ...typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? { code } : {},
+    ...Number.isInteger(status) && status >= 400 && status <= 599 ? { status } : {},
+    ...Number.isFinite(source.providerRetryAfterMs) && source.providerRetryAfterMs > 0 ? { providerRetryAfterMs: source.providerRetryAfterMs } : {},
+  }
+}
+
+/** Wire error metadata; no arbitrary provider properties are forwarded. */
+export function forwardFailure(outcome, anthropic = false) {
+  const failure = carryFailure(outcome.failure ?? { message: String(outcome.error) })
+  const classes = {
+    INVALID_CREDENTIAL: [401, 'authentication_error'],
+    AUTHORIZATION_REQUIRED: [403, 'permission_error'],
+    LANE_LOCKED: [403, 'permission_error'],
+    REGION_BLOCKED: [403, 'permission_error'],
+    PERMISSION_DENIED: [403, 'permission_error'],
+    QUOTA_EXHAUSTED: [429, 'insufficient_quota'],
+    RATE_LIMIT: [429, 'rate_limit_error'],
+    CLIENT_ERROR: [400, 'invalid_request_error'],
+    ABORTED: [400, 'invalid_request_error'],
+    TIMEOUT: [504, 'server_error'],
+    EAC_UPSTREAM_FAILED: [502, 'server_error'],
+    NO_PROGRESS: [504, 'server_error'],
+  }
+  const byStatus = { 400: 'invalid_request_error', 401: 'authentication_error', 403: 'permission_error', 404: 'invalid_request_error', 429: 'rate_limit_error' }
+  const [fallbackStatus, type] = classes[failure.code] ?? [502, byStatus[failure.status] ?? 'server_error']
+  return {
+    status: failure.status ?? fallbackStatus,
+    error: { message: failure.message, type: anthropic && type === 'server_error' ? 'api_error' : type, ...(failure.code ? { code: failure.code } : {}) },
+    retryAfterMs: failure.providerRetryAfterMs,
+    classified: Boolean(failure.code || failure.status),
   }
 }

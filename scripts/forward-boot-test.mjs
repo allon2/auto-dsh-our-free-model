@@ -21,6 +21,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import net from 'node:net'
 import { callRoute, fakeContext, freePort, stubUpstream, until } from './lib/fake-kernel.mjs'
 
 let failures = 0
@@ -67,7 +68,12 @@ try {
   const listed = await fetch(`http://127.0.0.1:${forwardPort}/v1/models`, {
     headers: { authorization: `Bearer ${stored.forwardKey}` },
   }).catch(() => null)
-  check('and serves a roster to its own key', [listed?.status, (await listed?.json())?.data?.length ?? 0], [200, 1])
+  // This fork advertises the built-in aggregate route beside the real models
+  // (autoChain defaults on), so the roster is the stub's listing plus the
+  // composed `auto-free-model` row at the tail.
+  const roster = (await listed?.json())?.data?.map(row => row.id) ?? []
+  check('and serves a roster to its own key — the listing plus the aggregate route',
+    [listed?.status, roster], [200, ['mimo-v2.6-flash-free', 'auto-free-model']])
 } catch (error) {
   check(`the port answers while the probe round is still in flight (${error?.message ?? error})`, false, true)
 }
@@ -92,6 +98,57 @@ try {
 
 for (const disposer of ctx.__disposers.reverse()) {
   try { disposer() } catch { /* a suite tearing down must not fail on teardown */ }
+}
+
+// A temporary conflict must not rewrite the user's desired port (#305).
+const previousHome = process.env.DSH_HOME
+const conflictHome = path.join(scratch, 'port-conflict')
+const conflictFile = path.join(conflictHome, 'our-free-model', 'settings.json')
+fs.mkdirSync(path.dirname(conflictFile), { recursive: true })
+const occupied = net.createServer(socket => socket.end())
+await new Promise(resolve => occupied.listen(0, '127.0.0.1', resolve))
+const requestedPort = occupied.address().port
+fs.writeFileSync(conflictFile, JSON.stringify({
+  forward: { enabled: true, host: '127.0.0.1', port: requestedPort },
+}))
+process.env.DSH_HOME = conflictHome
+let conflictCtx
+const stopConflict = () => {
+  for (const dispose of conflictCtx?.__disposers.splice(0).reverse() ?? []) dispose()
+}
+const bootConflict = async () => {
+  const registrations = []
+  conflictCtx = fakeContext({ inject, mounted: ['llm', 'webServer'], onRegister: route => registrations.push(route) })
+  apply(conflictCtx, { distribution: 'managed' })
+  const handler = () => registrations.find(route => route.kind === 'prefix')?.handler
+  await until(() => handler() !== undefined, { what: 'conflict generation API' })
+  const snapshot = async () => (await callRoute(handler(), 'GET', '/api/our-free-model/summary')).json
+  await until(async () => (await snapshot()).settings.forward.running, { what: 'conflict listener', timeoutMs: 10000 })
+  return { handler: handler(), snapshot }
+}
+try {
+  let generation = await bootConflict()
+  const fallback = (await generation.snapshot()).settings.forward.actualPort
+  check('occupied requested port falls back to another live port', fallback !== requestedPort, true)
+  check('fallback preserves the desired port on disk', JSON.parse(fs.readFileSync(conflictFile)).forward.port, requestedPort)
+  await callRoute(generation.handler, 'POST', '/api/our-free-model/settings', { probeIntervalMinutes: 21 })
+  check('an unrelated save keeps the same fallback listener', (await generation.snapshot()).settings.forward.actualPort, fallback)
+  check('an unrelated save preserves the original desired port', JSON.parse(fs.readFileSync(conflictFile)).forward.port, requestedPort)
+  const recipes = await callRoute(generation.handler, 'GET', '/api/our-free-model/clients')
+  check('client recipes advertise the actual fallback port', recipes.json.baseUrl, `http://127.0.0.1:${fallback}`)
+  stopConflict()
+  await new Promise(resolve => occupied.close(resolve))
+  generation = await bootConflict()
+  check('after restart the released requested port is recovered', (await generation.snapshot()).settings.forward.actualPort, requestedPort)
+  await callRoute(generation.handler, 'POST', '/api/our-free-model/settings', { forward: { port: 0 } })
+  const automaticPort = (await generation.snapshot()).settings.forward.actualPort
+  check('port zero stays a desired configuration value', JSON.parse(fs.readFileSync(conflictFile)).forward.port, 0)
+  await callRoute(generation.handler, 'POST', '/api/our-free-model/settings', { probeIntervalMinutes: 22 })
+  check('port zero does not rebind on unrelated saves', (await generation.snapshot()).settings.forward.actualPort, automaticPort)
+} finally {
+  stopConflict()
+  if (occupied.listening) await new Promise(resolve => occupied.close(resolve))
+  process.env.DSH_HOME = previousHome
 }
 
 // 相对 DSH_HOME 仍应读取原目录，核心接收到的路径须由插件入口归一化。

@@ -115,8 +115,15 @@ export default {
 
       const skew = Number.parseInt(env.CLOCK_SKEW_SECONDS ?? '600', 10) || 600
       const maxBody = Number.parseInt(env.MAX_BODY_BYTES ?? '8388608', 10) || 8388608
-      const body = route.body === true ? await request.text() : ''
-      if (body.length > maxBody) return JSON_ERROR(413, 'request body too large')
+      // MAX_BODY_BYTES is a byte cap, and the self-hosted host enforces it on the
+      // bytes it received (gateway-node.mjs sums `chunk.length`). Measuring the
+      // decoded string's `.length` here measured UTF-16 code units instead, so a
+      // multibyte body slipped past at up to three times the configured cap and
+      // the two hosts disagreed about the same variable. Measure the bytes that
+      // actually arrived — before any decoding, and before the signature work.
+      const received = route.body === true ? await request.arrayBuffer() : null
+      if (received !== null && received.byteLength > maxBody) return JSON_ERROR(413, 'request body too large')
+      const body = received === null ? '' : new TextDecoder().decode(received)
 
       const secrets = String(env.SIGNING_SECRETS ?? '').split(',').map(s => s.trim()).filter(s => s.length >= 32)
       if (secrets.length === 0) return JSON_ERROR(500, 'gateway is not configured')
@@ -172,6 +179,12 @@ export default {
           'user-agent': 'dsh-our-free-model-gateway',
         },
         body: route.body === true ? body : undefined,
+        // Carry the caller's cancellation into the relay connection. Without
+        // it a client that hangs up while the relay is still thinking leaves
+        // the upstream request running: the relay keeps billing capacity for an
+        // answer nobody will read, and on the self-hosted node host the
+        // concurrency slot stays held until the process restarts (#680).
+        signal: request.signal,
       })
       const headers = new Headers({ 'cache-control': 'no-store' })
       for (const name of PASS_HEADERS) {
@@ -181,6 +194,10 @@ export default {
       console.log(JSON.stringify({ lane: 'eac', path: url.pathname, status: relayed.status, ms: Date.now() - started }))
       return new Response(relayed.body, { status: relayed.status, headers })
     } catch (error) {
+      // A cancellation is the expected way out when the caller hangs up, not a
+      // gateway fault: logging it as a 500 makes an operator chase a server
+      // error that never happened.
+      if (request.signal.aborted) return new Response(null, { status: 499 })
       console.log(JSON.stringify({ lane: 'eac', path: url.pathname, status: 500, ms: Date.now() - started, fault: String(error?.message ?? error).slice(0, 120) }))
       return JSON_ERROR(500, 'gateway request failed')
     }

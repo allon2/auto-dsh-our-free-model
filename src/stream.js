@@ -61,11 +61,40 @@ function mintToolCallId() {
   return `call_${crypto.randomBytes(12).toString('hex')}`
 }
 
+// Arguments that never parse split into two kinds (issue #474): a structurally
+// incomplete value (unclosed string, unbalanced brackets — output cut by the
+// ceiling or lost frames) and a complete-but-invalid one (a bare value with all
+// brackets closed). Only the first marks the turn broken; the second is a
+// normal tool-call whose schema violation comes back to the model as a
+// fixable error, while flagging it would masquerade as max-tokens and kill
+// every recovery path.
+function argumentsCutMidway(raw) {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (const ch of raw) {
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+    } else if (ch === '"') inString = true
+    else if (ch === '{' || ch === '[') depth += 1
+    else if (ch === '}' || ch === ']') depth -= 1
+  }
+  // Unbalanced is incomplete in either direction: a negative depth is the
+  // lost-prefix fragment shape (`"path.txt"}`), which belongs on the
+  // proven retry path, not on the complete-but-invalid one.
+  return inString || depth !== 0
+}
+
 class BlockSink {
-  constructor(yieldChunk, startIndex, checkpointLimit) {
+  constructor(yieldChunk, startIndex, checkpointLimit, onProgress, renameMap) {
     this.emit = yieldChunk
     this.next = startIndex
-    /** @type {Map<string, {index:number, kind:string, text:string, id?:string, name?:string, args?:string}>} */
+    this.onProgress = typeof onProgress === 'function' ? onProgress : () => {}
+    /** The rename map the raw Chat tool names resolve through. */
+    this.renameMap = renameMap
+    /** @type {Map<string, {index:number, kind:string, text:string, id?:string, name?:string, rawName?:string, args?:string}>} */
     this.open = new Map()
     this.usage = undefined
     this.sawReasoning = false
@@ -150,14 +179,49 @@ class BlockSink {
 
   toolStart(key, id, name) {
     const block = this.slot(key, 'tool-call')
+    const priorId = block.id
+    const priorName = block.name
     if (id) block.id = id
     if (name) block.name = name
+    // A named call can precede its arguments without emitting a delta.
+    if (typeof block.name === 'string' && block.name.trim() !== ''
+      && (block.name !== priorName || block.id !== priorId)) this.onProgress()
+  }
+
+  /**
+   * Buffer one fragment of a Chat tool call's wire name (`toolNameFragment`).
+   *
+   * Some gateways split `tool_calls[].function.name` across delta frames — and
+   * resolving every fragment on arrival used to fold a half name into a wrong
+   * or unknown tool, surfacing ghost calls. Buffering the fragments until the
+   * arguments start is the behaviour measured as correct on this lane. The raw name accumulates here and resolves through
+   * {@link resolveRawName} once the call's arguments start or the block closes;
+   * until then the emitted deltas simply carry no name, which downstream
+   * consumers already tolerate (arguments can legitimately precede a name).
+   */
+  toolNameFragment(key, id, fragment) {
+    const block = this.slot(key, 'tool-call')
+    if (id) block.id = id
+    // Real servers repeat the *complete* name on every delta; a genuinely split
+    // name arrives as disjoint fragments. Extend when the fragment continues
+    // (or repeats) what we hold, concatenate only when it cannot be a repeat —
+    // that covers both shapes without ever doubling a repeated name.
+    const held = typeof block.rawName === 'string' ? block.rawName : ''
+    block.rawName = fragment.startsWith(held) ? fragment : held + fragment
+  }
+
+  /** Resolve a buffered raw wire name once, right before its first consumer needs it. */
+  #resolveRawName(block) {
+    if (block.name || typeof block.rawName !== 'string' || block.rawName === '') return
+    block.name = restoreToolName(block.rawName, this.renameMap)
+    this.onProgress()
   }
 
   toolArgs(key, delta) {
     this.sawToolCall = true
     if (!delta) return
     const block = this.slot(key, 'tool-call')
+    this.#resolveRawName(block)
     block.args += delta
     // Arguments can arrive before the wire has named the call (a Claude-relay
     // stream does exactly this). The harness re-reads every chunk through a
@@ -179,13 +243,14 @@ class BlockSink {
       if (block.kind === 'text' && block.text !== '') this.emit({ type: 'block-end', index: block.index, block: { type: 'text', text: block.text } })
       else if (block.kind === 'reasoning' && block.text !== '') this.emit({ type: 'block-end', index: block.index, block: { type: 'reasoning', text: block.text } })
       else if (block.kind === 'tool-call') {
+        this.#resolveRawName(block)
         // Arguments that never parse are an unexecutable call. The gateway
         // reports finish "tool_calls" even when the output ceiling cut the JSON
         // mid-string (verified live 2026-09-25), so the finish token alone
         // cannot be trusted; the adapter downgrades such a turn to max-tokens,
         // which makes the harness's assembler prune the call instead of
         // executing it and looping on the model's retry.
-        try { JSON.parse(block.args === '' ? '{}' : block.args) } catch { this.brokenToolCall = true }
+        try { JSON.parse(block.args === '' ? '{}' : block.args) } catch { this.brokenToolCall = argumentsCutMidway(block.args) }
         // So is a call that never learned its name (issue #92): a relayed model
         // leaked its tool markup mid-text, the gateway half-parsed it into an
         // empty-named call shell, and the harness executed the nameless call as
@@ -231,6 +296,44 @@ export function mapUsage(usage) {
   if (cacheWrite > 0) out.cacheWriteTokens = cacheWrite
   if (reasoning > 0) out.reasoningTokens = reasoning
   out.totalTokens = (prompt ?? 0) + (completion ?? 0)
+  return out
+}
+
+/**
+ * Drop input-side usage that cannot fit inside the advertised context window.
+ *
+ * Multimodal replies on the Kilo `kilo-auto/free` router have stamped
+ * `totalTokens` far above the model's declared window after a short vision
+ * turn — hosts that soft-budget from that sample then fail-closed with
+ * CONTEXT_WINDOW_EXCEEDED even when the local conversation surface is tiny
+ * (see Ebony-Vinyl/dsh-our-free-model#494, #464; related image-spill history
+ * #151 / #195). Output / reasoning counts stay so decode stats remain usable;
+ * omitting `totalTokens` and zeroing prompt pressure lets the host fall back
+ * to its local estimate. The Adapter restricts this heuristic to that exact
+ * channel/model; an advertised fallback window is not proof of bad usage on
+ * other routes. Its accumulator must preserve the absence of exact input/total
+ * counts even when a later continuation reports ordinary usage.
+ *
+ * @param {object|undefined} usage - harness TokenUsage from {@link mapUsage}
+ * @param {number|undefined} contextWindow - advertised window for this model
+ * @returns {object|undefined} trusted usage, or undefined when nothing remains
+ */
+export function sanitizeUsage(usage, contextWindow) {
+  if (!usage || typeof usage !== 'object') return usage
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0) return usage
+  const input = number(usage.inputTokens) ?? 0
+  const cacheRead = number(usage.cacheReadTokens) ?? 0
+  const prompt = input + cacheRead
+  const total = number(usage.totalTokens)
+  const over =
+    prompt > contextWindow
+    || (total !== undefined && total > contextWindow)
+  if (!over) return usage
+  const output = number(usage.outputTokens) ?? 0
+  const reasoning = number(usage.reasoningTokens)
+  if (output <= 0 && (reasoning === undefined || reasoning <= 0)) return undefined
+  const out = { inputTokens: 0, outputTokens: output }
+  if (reasoning !== undefined && reasoning > 0) out.reasoningTokens = reasoning
   return out
 }
 
@@ -289,7 +392,9 @@ function feedChat(sink, payload, renameMap, onFinish) {
       sink.sawToolCall = true
       const key = sink.toolKey(call)
       const name = call.function?.name
-      if (typeof name === 'string' && name !== '') sink.toolStart(key, call.id ?? '', restoreToolName(name, renameMap))
+      // The name is buffered, not resolved per fragment: split frames used to
+      // fold a half name into a ghost tool (see BlockSink.toolNameFragment).
+      if (typeof name === 'string' && name !== '') sink.toolNameFragment(key, call.id ?? '', name)
       else if (call.id) sink.toolStart(key, call.id, '')
       if (call.function?.arguments) sink.toolArgs(key, call.function.arguments)
     }
@@ -428,6 +533,7 @@ export function windowTokens(usage, sawReasoning) {
  * @param {number} [options.startIndex=0] - 新块的起始索引
  * @param {number} [options.checkpointLimit=131072] - 推理检查点的最大字符串长度
  * @param {(snapshot: object) => void} [options.onState] - 发布本次读取的已知状态
+ * @param {() => void} [options.onProgress] - Meaningful tool metadata arrived before arguments.
  * @yields {object} harness StreamChunk
  * @returns {Promise<{ usage: object, finish?: string, sawFinish: boolean, sawUsage: boolean, sawToolCall: boolean, sawReasoning: boolean, firstDeltaAt?: number, nextIndex: number, reasoningText: string, checkpointTruncated: boolean }>}
  */
@@ -435,7 +541,7 @@ export async function * readStream(lines, wire, renameMap, now = () => Date.now(
   const outbox = []
   const startIndex = Number.isSafeInteger(options?.startIndex) && options.startIndex >= 0 ? options.startIndex : 0
   const checkpointLimit = Number.isSafeInteger(options?.checkpointLimit) && options.checkpointLimit >= 0 ? options.checkpointLimit : 131072
-  const sink = new BlockSink(chunk => outbox.push(chunk), startIndex, checkpointLimit)
+  const sink = new BlockSink(chunk => outbox.push(chunk), startIndex, checkpointLimit, options?.onProgress, renameMap)
   const state = { usage: undefined, finish: undefined, sawFinish: false, sawUsage: false, sawToolCall: false, firstDeltaAt: undefined, sawReasoning: false, sawText: false, brokenToolCall: false }
   const snapshot = () => ({
     ...state,
@@ -478,6 +584,9 @@ export async function * readStream(lines, wire, renameMap, now = () => Date.now(
       if (!text.startsWith('{')) continue
       let payload
       try { payload = JSON.parse(text) } catch { continue }
+      if ((payload.type === 'response.failed' || payload.response?.status === 'failed') && payload.response?.error) {
+        throw classifyFailure(undefined, { error: payload.response.error })
+      }
       if (payload.type === 'error' || payload.error) {
         // Classify an in-stream refusal exactly as an error *envelope* is
         // classified, because everything downstream decides off `code`. This throw

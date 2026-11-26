@@ -11,6 +11,10 @@ const dataDir = path.join(scratch, 'data')
 const model = 'mimo-v2.6-flash-free'
 const kilo = 'nvidia/nemotron-3.5-lightning:free'
 let calls = 0
+let failedListing = ''
+let emptyFreeListing = false
+let freeListing = model
+let kiloListing = kilo
 let holdNextCall = false
 let notifyCall
 let notifyClosed
@@ -18,10 +22,16 @@ const upstream = http.createServer((req, res) => {
   req.resume()
   req.on('end', () => {
     if (req.method === 'GET') {
+      const source = req.url === '/models' ? 'kilo' : 'free'
+      if (failedListing === source) {
+        res.writeHead(503, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: '模拟清单刷新失败' }))
+        return
+      }
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ data: req.url === '/models'
-        ? [{ id: kilo, isFree: true, name: '测试免费模型' }]
-        : [{ id: model }] }))
+      res.end(JSON.stringify({ data: source === 'kilo'
+        ? kiloListing === null ? [] : [{ id: kiloListing, isFree: true, name: '测试免费模型' }]
+        : emptyFreeListing || freeListing === null ? [] : [{ id: freeListing }] }))
     } else {
       calls++
       if (holdNextCall) {
@@ -94,9 +104,50 @@ const login = async body => {
   return setCookie.split(';')[0]
 }
 
+async function verifyCoreManagementSummary() {
+  const { createModelRuntime, createRuntimeStores } = await import('../src/core/runtime.js')
+  const { createManagement } = await import('../packages/standalone/management.mjs')
+  const coreDataDir = path.join(scratch, 'core-management')
+  const coreKey = 'isolated-core-management-summary'
+  const logger = { warn() {} }
+  const stores = createRuntimeStores({ dataDir: coreDataDir, logger })
+  stores.settings.update({ enabled: true, exposeRegionModels: true, combos: [], forwardKey: coreKey })
+  const runtime = createModelRuntime({ ...stores, logger })
+  const management = createManagement({
+    stores, runtime,
+    info: () => ({ version: 'core-composition-test', dataDir: coreDataDir, networkMode: 'fixture' }),
+  })
+  const server = http.createServer((req, res) => {
+    void management.handleRequest(req, res).then(handled => {
+      if (!handled) { res.writeHead(404); res.end() }
+    })
+  })
+  try {
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    management.setPort(server.address().port)
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/management/summary`, {
+      headers: { authorization: `Bearer ${coreKey}` }, signal: AbortSignal.timeout(10000),
+    })
+    assert.equal(response.status, 200)
+    const summary = await response.json()
+    // Six built-in free rows plus this fork's composed aggregate route row,
+    // which rides the catalog tail like any other dialable model.
+    assert.equal(summary.catalog.length, 7)
+    assert.equal(summary.catalog.every(row => row.routable === true), true)
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+    await management.dispose()
+    runtime.dispose()
+    stores.dispose()
+  }
+}
+
 try {
   await check('macOS 与 Windows 固定启动器安全引用路径，令牌只经 stdin 复制', verifyLoginLaunchers)
   await check('本机取令牌入口限制来源与参数，拒绝并发且不泄露密钥或创建会话', verifyLoginTerminal)
+  await check('真实核心运行时与管理直接组合时摘要仍可读取', verifyCoreManagementSummary)
   service = await startStandalone({ dataDir, port: 0, refresh: false, logger: { warn() {} } })
   key = getKey()
   await check('页面资源本地提供且不包含密钥，健康接口仍兼容', async () => {
@@ -191,6 +242,11 @@ try {
       { defaultMaxTokens: 131073 }, { probeIntervalMinutes: 0 },
       { probeIntervalMinutes: 1441 }, { probeIntervalMinutes: '15' },
       { standaloneProbe: {} }, { enabled: false, probeIntervalMinutes: 0 },
+      { hideFreeModels: 'true' }, { hideEacModels: 1 }, { hiddenModelIds: null },
+      { hiddenModelIds: [1] }, { hiddenModelIds: [''] }, { hiddenModelIds: [' x'] },
+      { hiddenModelIds: ['x\n'] }, { hiddenModelIds: ['x'.repeat(301)] },
+      { hiddenModelIds: Array(1001).fill('model') },
+      { enabled: false, hiddenModelIds: [false] },
     ]) assert.equal((await request('/api/management/settings', { body })).status, 400)
     assert.equal(getKey(), key)
     assert.equal(service.runtime.state().settings.enabled, true)
@@ -241,7 +297,16 @@ try {
     assert.equal((await request('/api/management/models/refresh', { body: { probe: 'yes' } })).status, 400)
     const tested = await request('/api/management/models/test', { body: { model } })
     assert.equal(tested.status, 200)
-    assert.equal((await tested.json()).text, 'OK')
+    const testResult = await tested.json()
+    assert.equal(testResult.text, 'OK')
+    assert.equal(testResult.persisted, true)
+    const measured = (await (await request('/api/management/summary')).json()).catalog.find(row => row.id === model)
+    assert.equal(measured.availabilitySource, 'manual')
+    assert.equal(measured.availability, 'available')
+    assert.equal(measured.ttftMs, testResult.ttftMs)
+    assert.equal(measured.latencyMs, testResult.totalMs)
+    const saved = JSON.parse(fs.readFileSync(path.join(dataDir, 'availability.json'), 'utf8'))
+    assert.equal(saved.manualResults[model].ttftMs, testResult.ttftMs)
     assert.equal(calls, before + 2)
     assert.equal((await request('/api/management/models/test', { body: { model: 'missing' } })).status, 404)
     assert.equal(calls, before + 2)
@@ -250,6 +315,180 @@ try {
     assert.equal(stats.turns, 1)
     assert.equal(stats.grand.input, 11)
     assert.equal(stats.grand.output, 7)
+  })
+  await check('刷新逐来源报告失败与保留的行数，恢复后不残留失败状态', async () => {
+    const before = calls
+    const refresh = async () => {
+      const response = await request('/api/management/models/refresh', { body: {} })
+      assert.equal(response.status, 200)
+      const result = await response.json()
+      assert.deepEqual(result.catalog.map(row => row.id), [model, kilo])
+      assert.equal(result.dataDir, dataDir)
+      assert.ok(!JSON.stringify(result).includes(key))
+      return result.sources
+    }
+    try {
+      for (const source of ['free', 'kilo']) {
+        failedListing = source
+        const sources = await refresh()
+        assert.deepEqual(sources[source], { ok: false, count: 1 })
+        assert.deepEqual(sources[source === 'free' ? 'kilo' : 'free'], { ok: true, count: 1 })
+        assert.deepEqual(sources.sealed, { ok: true, count: 0, skipped: true })
+      }
+      failedListing = ''
+      emptyFreeListing = true
+      assert.deepEqual((await refresh()).free, { ok: false, count: 1 })
+      emptyFreeListing = false
+      const sources = await refresh()
+      assert.deepEqual(sources.free, { ok: true, count: 1 })
+      assert.deepEqual(sources.kilo, { ok: true, count: 1 })
+      assert.equal(calls, before, '清单失败不能触发推理或探测')
+    } finally { failedListing = ''; emptyFreeListing = false }
+  })
+  await check('同一 Beam 家族在 Kilo 离场、缓存失败和归队时沿用同一保存记录', async () => {
+    const beamFree = 'beam-free'
+    const beamKilo = 'reflection/beam-free'
+    const refresh = async () => {
+      const response = await request('/api/management/models/refresh', { body: {} })
+      assert.equal(response.status, 200)
+      return response.json()
+    }
+    const listing = async () => (await (await request('/v1/models', {
+      headers: { authorization: `Bearer ${key}` },
+    })).json()).data.map(row => row.id)
+    const summary = async () => (await request('/api/management/summary')).json()
+    try {
+      freeListing = beamFree
+      kiloListing = beamKilo
+      failedListing = ''
+      assert.equal((await request('/api/management/settings', { body: { hiddenModelIds: [] } })).status, 200)
+      assert.deepEqual((await refresh()).catalog.map(row => row.id), [beamFree, beamKilo])
+      assert.deepEqual(await listing(), [beamFree, beamKilo])
+
+      assert.equal((await request('/api/management/settings', {
+        body: { hiddenModelIds: [beamKilo] },
+      })).status, 200)
+      const linked = await summary()
+      assert.deepEqual(linked.catalog.map(row => [row.id, row.hiddenByUser, row.hiddenIds]), [
+        [beamFree, true, [beamKilo]], [beamKilo, true, [beamKilo]],
+      ])
+      assert.deepEqual(await listing(), [])
+
+      kiloListing = null
+      failedListing = 'kilo'
+      const failed = await refresh()
+      assert.deepEqual(failed.sources.kilo, { ok: false, count: 1 })
+      assert.deepEqual(failed.catalog.map(row => row.id), [beamFree, beamKilo])
+      assert.deepEqual(await listing(), [], 'a failed refresh keeps the cached family rows and their visibility')
+
+      failedListing = ''
+      const shrunk = await refresh()
+      assert.deepEqual(shrunk.sources.kilo, { ok: true, count: 0 })
+      assert.deepEqual(shrunk.catalog.map(row => row.id), [beamFree])
+      assert.deepEqual((await summary()).settings.hiddenModelIds, [beamKilo])
+      assert.deepEqual(await listing(), [beamFree], 'the departed Kilo record pauses family impact')
+      const afterShrink = await summary()
+      assert.deepEqual([
+        afterShrink.catalog.find(row => row.id === beamFree)?.hiddenByUser,
+        afterShrink.catalog.find(row => row.id === beamFree)?.hiddenIds,
+      ], [false, []])
+
+      assert.equal((await request('/api/management/settings', {
+        body: { hiddenModelIds: [beamKilo, beamFree] },
+      })).status, 200)
+      const bothSaved = await summary()
+      const freeRow = bothSaved.catalog.find(row => row.id === beamFree)
+      const restored = bothSaved.settings.hiddenModelIds.filter(id => !new Set(freeRow.hiddenIds).has(id))
+      assert.deepEqual([freeRow.hiddenByUser, freeRow.hiddenIds, restored], [true, [beamFree], [beamKilo]])
+      assert.equal((await request('/api/management/settings', { body: { hiddenModelIds: restored } })).status, 200)
+      assert.deepEqual(await listing(), [beamFree])
+
+      kiloListing = beamKilo
+      assert.deepEqual((await refresh()).catalog.map(row => row.id), [beamFree, beamKilo])
+      const returned = await summary()
+      assert.deepEqual(returned.catalog.map(row => [row.id, row.hiddenByUser, row.hiddenIds]), [
+        [beamFree, true, [beamKilo]], [beamKilo, true, [beamKilo]],
+      ])
+      assert.deepEqual(returned.settings.hiddenModelIds, [beamKilo])
+      assert.deepEqual(await listing(), [], 'the retained Kilo record re-links when the row returns')
+    } finally {
+      freeListing = model
+      kiloListing = kilo
+      failedListing = ''
+      emptyFreeListing = false
+      await request('/api/management/settings', { body: { hiddenModelIds: [] } })
+      await refresh()
+    }
+  })
+  await check('账号渠道刷新逐供应商返回失败、行数和恢复结果', async () => {
+    const channelDir = path.join(scratch, 'channel-refresh')
+    fs.mkdirSync(channelDir, { recursive: true })
+    const fixtureFile = path.join(channelDir, 'refresh-fixture.json')
+    const fixture = {
+      trae: { models: [{ id: 'fixture-trae', name: 'TRAE 测试模型' }] },
+      qodercn: { models: [{ id: 'fixture-qoder', name: 'Qoder 测试模型' }] },
+    }
+    const save = () => fs.writeFileSync(fixtureFile, JSON.stringify(fixture))
+    save()
+    const argv = [...process.execArgv]
+    let instance
+    try {
+      process.execArgv.push('--import', new URL('./lib/standalone-refresh-fixture.mjs', import.meta.url).href)
+      instance = await startStandalone({ dataDir: channelDir, port: 0, refresh: false, logger: { warn() {} } })
+      await instance.ready
+      const forwardKey = JSON.parse(fs.readFileSync(instance.keyFile, 'utf8')).forwardKey
+      for (const failed of [false, true, false]) {
+        fixture.trae.fail = failed
+        save()
+        const response = await fetch(instance.url + '/api/management/models/refresh', {
+          method: 'POST', headers: { authorization: `Bearer ${forwardKey}`, 'content-type': 'application/json' },
+          body: '{}', signal: AbortSignal.timeout(10000),
+        })
+        assert.equal(response.status, 200)
+        const result = await response.json()
+        assert.deepEqual(result.sources.trae, { ok: !failed, count: failed ? 0 : 1 })
+        assert.deepEqual(result.sources.qodercn, { ok: true, count: 1 })
+        assert.deepEqual(result.sources.free, { ok: true, count: 1 })
+        assert.equal(result.catalog.filter(row => row.channel === 'trae').length, failed ? 0 : 1)
+        assert.equal(JSON.stringify(result).includes('fixture-private-token'), false)
+      }
+      const listing = instance.channels.refresh()
+      const report = instance.channels.refresh({ report: true })
+      assert.ok(Array.isArray(await listing), '既有渠道调用仍返回模型数组')
+      assert.deepEqual((await report).sources.trae, { ok: true, count: 1 })
+    } finally {
+      process.execArgv.splice(0, process.execArgv.length, ...argv)
+      await instance?.close()
+    }
+  })
+  await check('EAC 清单成功或失败前授权已切换时，返回跳过且不覆盖当前目录', async () => {
+    const { createRuntimeStores, createModelRuntime } = await import('../src/core/runtime.js')
+    const { lane } = await import('../src/eac.js')
+    const stores = createRuntimeStores({ dataDir: path.join(scratch, 'sealed-refresh'), logger: { warn() {} } })
+    stores.catalogStore.update({ sealIds: ['fixture-cached'] })
+    let credential = { mode: 'direct', base, apiKey: 'fixture-sealed-key', userToken: 'fixture-old-user' }
+    const runtime = createModelRuntime({ ...stores, sealedCredential: () => credential, logger: { warn() {} } })
+    const cached = runtime.catalog.filter(row => row.channel === 'eac').map(row => row.id)
+    const originalFetch = lane.fetch
+    try {
+      assert.equal(cached.length, 1)
+      for (const failed of [false, true]) {
+        credential = { ...credential, userToken: 'fixture-old-user' }
+        lane.fetch = async () => {
+          credential = { ...credential, userToken: 'fixture-new-user' }
+          return new Response(JSON.stringify(failed ? { error: { message: 'refused' } } : { data: [{ id: 'fixture-stale' }] }), { status: failed ? 401 : 200 })
+        }
+        const result = await runtime.refreshCatalog({ report: true })
+        assert.deepEqual(result.sources.sealed, { ok: false, count: 1, skipped: true })
+        assert.deepEqual(runtime.catalog.filter(row => row.channel === 'eac').map(row => row.id), cached)
+        assert.equal(JSON.stringify(result.sources).includes('fixture-old-user'), false)
+        assert.equal(JSON.stringify(result.sources).includes('fixture-new-user'), false)
+      }
+    } finally {
+      lane.fetch = originalFetch
+      runtime.dispose()
+      stores.dispose()
+    }
   })
   await check('取消单模型测试会关闭真实上游请求且管理会话仍可使用', async () => {
     const started = new Promise(resolve => { notifyCall = resolve })
@@ -274,6 +513,38 @@ try {
       assert.equal(calls, before + 1)
       assert.equal((await request('/api/management/summary')).status, 200)
     } finally { controller.abort(); holdNextCall = false }
+  })
+  await check('模型隐藏只过滤公开清单，保留管理入口和历史调用并持久化', async () => {
+    const listing = async () => (await (await request('/v1/models', { headers: { authorization: `Bearer ${key}` } })).json()).data
+    assert.equal((await request('/api/management/settings', {
+      body: { hiddenModelIds: [model, model, 'unrelated-hidden-probe'] },
+    })).status, 200)
+    assert.deepEqual((await listing()).map(row => row.id), [kilo])
+    const summary = await (await request('/api/management/summary')).json()
+    assert.deepEqual(summary.settings.hiddenModelIds, [model, 'unrelated-hidden-probe'])
+    assert.equal(summary.catalog.find(row => row.id === model).hiddenByUser, true)
+    assert.deepEqual(summary.catalog.find(row => row.id === model).hiddenIds, [model],
+      'the hidden row receives only its own stored family ids')
+    assert.deepEqual(summary.catalog.find(row => row.id === kilo).hiddenIds, [],
+      'an unrelated Kilo row receives no hidden ids and is not leaked the blacklist')
+    assert.equal(summary.catalog.find(row => row.id === model).routable, false)
+    assert.equal(JSON.stringify(summary).includes(key), false)
+    const historical = await request('/v1/chat/completions', {
+      cookie: '',
+      headers: { authorization: `Bearer ${key}` },
+      body: { model, messages: [{ role: 'user', content: 'hidden history still works' }] },
+    })
+    assert.equal(historical.status, 200, 'a hidden id with saved history remains callable')
+    assert.equal((await historical.json()).choices[0].message.content, 'OK')
+    assert.equal((await request('/api/management/models/test', { body: { model } })).status, 200,
+      'hidden history ids remain callable')
+    assert.equal((await request('/api/management/settings', { body: { hiddenModelIds: [], hideFreeModels: true, hideEacModels: true } })).status, 200)
+    assert.deepEqual(await listing(), [])
+    assert.equal((await (await request('/api/management/summary')).json()).catalog.length, 2)
+    const hiddenSettings = { hiddenModelIds: [model], hideFreeModels: false, hideEacModels: true }
+    assert.equal((await request('/api/management/settings', { body: hiddenSettings })).status, 200)
+    const stored = JSON.parse(fs.readFileSync(service.keyFile, 'utf8'))
+    for (const [name, value] of Object.entries(hiddenSettings)) assert.deepEqual(stored[name], value)
   })
   await check('轮换要求确认，旧密钥与其他会话失效，当前管理会话保留', async () => {
     const other = await login({ key })
@@ -314,6 +585,9 @@ try {
     assert.notEqual(service.managementUrl, oldUrl)
     assert.equal(service.runtime.state().settings.defaultMaxTokens, 8192)
     assert.equal(service.runtime.state().settings.standaloneProbe, true)
+    assert.deepEqual(service.runtime.state().settings.hiddenModelIds, [model])
+    assert.equal(service.runtime.state().settings.hideEacModels, true)
+    assert.equal(service.runtime.state().settings.hideFreeModels, false)
     assert.equal((await request('/api/management/summary')).status, 401)
     const token = new URLSearchParams(new URL(service.managementUrl).hash.slice(1)).get('login')
     const nativeNow = Date.now
@@ -323,6 +597,10 @@ try {
       assert.equal((await request('/api/management/session', { cookie: '', body: { bootstrapToken: token } })).status, 401)
     } finally { Date.now = nativeNow }
     cookie = await login({ key })
+    const visible = await (await request('/v1/models', { headers: { authorization: `Bearer ${key}` } })).json()
+    assert.equal(visible.data.some(row => row.id === model), false)
+    assert.equal((await request('/api/management/settings', { body: { hiddenModelIds: [], hideEacModels: false } })).status, 200)
+    assert.equal((await (await request('/v1/models', { headers: { authorization: `Bearer ${key}` } })).json()).data.some(row => row.id === model), true)
   })
   await check('设置变更重新安排周期任务且 --no-refresh 保持无自动请求', async () => {
     const nativeTimeout = globalThis.setTimeout

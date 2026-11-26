@@ -8,7 +8,7 @@
  * Run: node scripts/trust-test.mjs
  */
 import assert from 'node:assert/strict'
-import { rejectionFor, structuralRejection, connectionAdmissionView } from '../src/trust.js'
+import { isLoopbackHost, rejectionFor, structuralRejection, connectionAdmissionView } from '../src/trust.js'
 
 let failures = 0
 const check = (name, fn) => {
@@ -17,6 +17,18 @@ const check = (name, fn) => {
 }
 
 const req = headers => ({ headers })
+
+// ── the bind-host check ──────────────────────────────────────────────────────
+// The listener's bind guard accepts every spelling a loopback address has,
+// including the bare IPv6 literal the service's own URL formatter supports.
+check('a bare IPv6 loopback literal is a valid bind host', () => {
+  for (const host of ['127.0.0.1', 'localhost', '[::1]', '::1']) {
+    assert.equal(isLoopbackHost(host), true, host)
+  }
+  for (const host of ['0.0.0.0', '192.168.1.2', 'evil.example', '', undefined]) {
+    assert.equal(isLoopbackHost(host), false, String(host))
+  }
+})
 
 // ── the structural fence ─────────────────────────────────────────────────────
 check('same-origin loopback request passes', () => {
@@ -176,6 +188,16 @@ check('the view takes a thunk and consults it from the moment the service appear
   assert.equal(rejectionFor(req({ host: '127.0.0.1:8080' }), view), undefined)
   service = { requestRejection: () => 401 }
   assert.equal(rejectionFor(req({ host: 'evil.example' }), view), 401)
+})
+
+check('the Host-admitted owner can use a required route on DSH 0.2.3', () => {
+  const legacy = connectionAdmissionView(() => ({}))
+  const request = req({ host: 'localhost' })
+  const owner = { principal: { kind: 'owner' }, signal: new AbortController().signal }
+  assert.equal(rejectionFor(request, legacy, undefined, owner), undefined)
+  assert.equal(rejectionFor(request, legacy, undefined, { ...owner, signal: AbortSignal.abort() }), 403)
+  assert.equal(rejectionFor(request, legacy, undefined, { ...owner, principal: { kind: 'guest' } }), 403)
+  assert.equal(rejectionFor(request, legacy), 503)
 })
 
 if (failures === 0) console.log('trust-test: OK')

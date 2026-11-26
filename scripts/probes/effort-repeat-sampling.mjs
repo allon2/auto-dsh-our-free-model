@@ -1,3 +1,14 @@
+/*!
+ * Vendored from 9router (https://github.com/decolua/9router, MIT,
+ * Copyright (c) 2024-2026 decolua and contributors), upstream file ".probe7.mjs".
+ *
+ * This is a byte-for-byte copy with the upstream base URL changed to the endpoint
+ * this plugin probes. It is kept as evidence for the findings in README.md, not as
+ * shipped code, and it imports 9router's own modules, so it does not run outside a
+ * 9router checkout.
+ *
+ * MIT licence text: LICENSE, section "9router".
+ */
 import { generateSessionId, generateRequestId } from "./open-sse/executors/opencode.js";
 import { applyFingerprintTools } from "./open-sse/utils/opencodeFingerprint.js";
 
@@ -17,7 +28,7 @@ const PROMPT = "Two trains 300 km apart approach each other at 60 and 90 km/h. A
 async function sample(model, extra) {
   const body = { model, messages: [{ role: "user", content: PROMPT }], stream: true, ...extra };
   applyFingerprintTools(body, false);
-  const res = await fetch(`${B}/zen/v1/chat/completions`, {
+  const res = await fetch(`${B}/inference/v1/chat/completions`, {
     method: "POST", headers: { ...HEADERS, "x-opencode-request": generateRequestId() }, body: JSON.stringify(body), redirect: "error",
   });
   if (!res.ok) return { err: `${res.status} ${(await res.text()).slice(0, 90).replace(/\s+/g, " ")}` };

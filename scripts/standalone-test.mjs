@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { CLIENT_UA } from '../src/o2a/version.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-standalone-'))
@@ -24,6 +25,7 @@ let holdListing
 let signalListingStarted
 let listingStarted
 let turns = []
+const anonymousRequests = []
 let throttleTurns = false
 let kiloListing = { data: [{ id: kiloModel, name: 'Test free model', isFree: true }] }
 const frames = text => [
@@ -35,7 +37,20 @@ const upstream = http.createServer((req, res) => {
   const chunks = []
   req.on('data', chunk => chunks.push(chunk))
   req.on('end', () => {
-    if (req.method === 'GET' && req.url === '/zen/v1/models') {
+    // The 2.1 client groups /inference routes by provider family
+    // (/inference/openai/v1/...), so the fingerprint mock matches the origin prefix.
+    if (req.url.startsWith('/inference/')) {
+      anonymousRequests.push({ method: req.method, headers: req.headers })
+      // v2 指纹：上游只认 `opencode/<channel>/<version>/<client>` 这一整串。
+      // 旧实现模拟的是「按名字拒掉独立服务的归属 UA」，那条规则属于 v1；
+      // v2 反过来 —— 拼接了归属的串不再是 v2 客户端，同样被拒。
+      if (req.method === 'POST' && !/^opencode\/[a-z0-9-]+\/\d+\.\d+\.\d+\/[a-z0-9-]+$/i.test(req.headers['user-agent'] ?? '')) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { name: 'FreeTierError', message: 'OpenCode free tier client rejected' } }))
+        return
+      }
+    }
+    if (req.method === 'GET' && req.url === '/inference/v1/models') {
       listingCalls++
       signalListingStarted?.()
       const respond = () => {
@@ -94,7 +109,13 @@ async function child(args, env = {}) {
     let stderr = ''
     proc.stdout.on('data', chunk => { stdout += chunk })
     proc.stderr.on('data', chunk => { stderr += chunk })
-    const deadline = setTimeout(() => { proc.kill(); reject(new Error('child timed out')) }, 10000)
+    // The isolation case boots a whole standalone service in a fresh process:
+    // module graph, engine probe and a health round trip. Measured on a loaded
+    // Windows box that is 2 s when idle and 11 s under contention, so a 10 s
+    // deadline turned the suite into a coin flip. The deadline exists to catch
+    // a hang, not to time a boot — 30 s still fails fast on a real hang while
+    // leaving room for a slow machine.
+    const deadline = setTimeout(() => { proc.kill(); reject(new Error('child timed out')) }, 30000)
     proc.once('error', error => { clearTimeout(deadline); reject(error) })
     proc.once('exit', code => { clearTimeout(deadline); resolve({ code, stdout, stderr }) })
   })
@@ -122,6 +143,41 @@ try {
     await assert.rejects(startStandalone({ dataDir: invalidDir, port: 65536 }), /port/)
     assert.equal(fs.existsSync(invalidDir), false)
   })
+  await check('退出时保留已被替换的其他锁，不清理无法确认归属的文件', async () => {
+    const directory = path.join(scratch, 'replaced-lock')
+    const isolated = await startStandalone({ dataDir: directory, port: 0, refresh: false, logger: { warn() {} } })
+    const lockFile = path.join(directory, 'service.lock')
+    const replacement = JSON.stringify({ pid: process.pid, product: 'our-free-model-standalone', token: 'another-owner' })
+    fs.unlinkSync(lockFile)
+    fs.writeFileSync(lockFile, replacement)
+    await isolated.close()
+    assert.equal(fs.readFileSync(lockFile, 'utf8'), replacement)
+  })
+  await check('启动中途失败会同时释放文件锁与进程互斥端点，修复配置后可重启', async () => {
+    const directory = path.join(scratch, 'failed-boot')
+    const settingsFile = path.join(directory, 'settings.json')
+    fs.mkdirSync(settingsFile, { recursive: true })
+    await assert.rejects(startStandalone({ dataDir: directory, port: 0, refresh: false, logger: { warn() {} } }), /persist/)
+    assert.equal(fs.existsSync(path.join(directory, 'service.lock')), false)
+    fs.rmdirSync(settingsFile)
+    const recovered = await startStandalone({ dataDir: directory, port: 0, refresh: false, logger: { warn() {} } })
+    await recovered.close()
+  })
+  if (process.platform === 'win32' || process.platform === 'linux') {
+    await check('没有权限检查进程时保留锁，不把 EPERM 当成进程退出', async () => {
+      const directory = path.join(scratch, 'permission-lock')
+      const lockFile = path.join(directory, 'service.lock')
+      fs.mkdirSync(directory)
+      const original = JSON.stringify({ pid: process.pid, product: 'our-free-model-standalone' })
+      fs.writeFileSync(lockFile, original)
+      const nativeKill = process.kill
+      process.kill = () => { throw Object.assign(new Error('permission denied'), { code: 'EPERM' }) }
+      try {
+        await assert.rejects(startStandalone({ dataDir: directory, port: 0, refresh: false }), { code: 'EEXIST' })
+        assert.equal(fs.readFileSync(lockFile, 'utf8'), original)
+      } finally { process.kill = nativeKill }
+    })
+  }
   await check('the listener starts while its upstream listing is held', async () => {
     holdListing = new Promise(resolve => { unhold = resolve })
     listingStarted = new Promise(resolve => { signalListingStarted = resolve })
@@ -210,6 +266,13 @@ try {
     assert.equal(kilo.status, 200)
     assert.equal((await kilo.json()).choices[0].message.content, 'kilo-ok')
   })
+  await check('独立服务的目录、探测和推理都带 v2 客户端指纹', () => {
+    assert.ok(anonymousRequests.some(req => req.method === 'GET'))
+    assert.ok(anonymousRequests.filter(req => req.method === 'POST').length >= 4)
+    for (const req of anonymousRequests) {
+      assert.equal(req.headers['user-agent'], CLIENT_UA)
+    }
+  })
   await check('unknown models are refused before spending an upstream call', async () => {
     const before = turns.length
     const response = await jsonRequest(`${service.url}/v1/chat/completions`, {
@@ -262,7 +325,7 @@ try {
     await service.runtime.refreshCatalog()
     assert.equal(listingCalls, calls)
   })
-  await check('周期探测遵守 429 退避，到期恢复，手动强制探测仍可执行', async () => {
+  await check('自动探测已禁用：--probe 与周期刷新都不发探测，手动探测仍可用', async () => {
     const nativeTimeout = globalThis.setTimeout
     const nativeNow = Date.now
     const started = nativeNow()
@@ -297,22 +360,19 @@ try {
     try {
       const before = turns.length
       probeService = await startStandalone({
-        dataDir: path.join(scratch, 'probe-backoff'), port: 0, probe: true,
+        dataDir: path.join(scratch, 'probe-disabled'), port: 0, probe: true,
         logger: { warn: message => warnings.push(message) },
       })
       await probeService.ready
-      assert.equal(turns.length, before + 1, '启动应探测匿名模型')
-      assert.ok(warnings.some(message => message.includes('pause for 30 minutes')))
+      assert.equal(turns.length, before, '启动不得探测匿名模型')
       const listingsBefore = listingCalls
       await runPeriod()
-      assert.equal(listingCalls, listingsBefore + 1, '退避期间仍刷新模型清单')
-      assert.equal(turns.length, before + 1, '15 分钟周期不得绕过 30 分钟退避')
-      await runPeriod()
-      assert.equal(turns.length, before + 2, '退避到期后应恢复探测')
+      assert.equal(listingCalls, listingsBefore + 1, '周期刷新仍更新模型清单')
+      assert.equal(turns.length, before, '周期刷新不得探测')
       await probeService.runtime.refreshCatalog({ probe: true, force: true })
-      assert.equal(turns.length, before + 3, '手动强制刷新可以绕过退避')
+      assert.equal(turns.length, before + 1, '显式手动探测仍可用')
       await runPeriod()
-      assert.equal(turns.length, before + 3, '手动强制刷新后周期任务仍遵守新的退避')
+      assert.equal(turns.length, before + 1, '下一轮周期仍不得探测')
     } finally {
       await probeService?.close()
       globalThis.setTimeout = nativeTimeout

@@ -1,5 +1,5 @@
 /**
- * 「每日首次启动自动签到」—— 开关、当日记录与执行体。
+ * 「每日自动签到」—— 开关、当日记录与执行体。
  *
  * ## 它做什么
  *
@@ -43,16 +43,6 @@
  *
  * ## ⚠️ 不支持的渠道怎么判：**不建第二份能力名单**
  *
- * 「哪些渠道能签到」的权威是客户端的 `credits-capabilities.js`（12 个渠道逐项
- * 登记）。在本模块再抄一份必然漂移（本仓库已有「两份名单漂移」的真实缺陷）。
- * 故判据交给 `credits.claimAll` 自己：cline / raccoon / **workbuddy** 三条分支
- * **不发任何上游请求**就返回「不支持每日签到」，本模块把这类错误计为**跳过**，
- * 既不算失败也不重试。
- *
- * ⚠️ 其中 **workbuddy 的那条守卫是本功能先补上的**：此前它会落到 buddy 产品
- * 分支、真去发必然失败的签到请求（客户端从不调用它，是因为能力表写着 false，
- * 所以这个洞一直没被触发）。补上之后，「调用即判定」这条规则才真正安全。
- *
  * ## ⚠️「调用即判定」管不到的一类：签到**有代价**的渠道
  *
  * zcode 有签到，但每次领取都要现场产阿里云 captcha（web 版会拉起 headful
@@ -74,7 +64,7 @@ import type { RpcCreditsClaimAllResponse, RpcUsageAutoCheckinState } from './typ
 /** 独立文档的文件名（与 state.json / ui-preferences.json 同目录）。 */
 export const AUTO_CHECKIN_FILE = 'auto-checkin.json'
 
-const SCHEMA = 'dsh-codearts-auth/auto-checkin/v1'
+const SCHEMA = 'channel-pack/auto-checkin/v1'
 
 /**
  * 文档内容。
@@ -182,6 +172,24 @@ export const DSH_CHANNEL_PACK_AUTO_CHECKIN_DELAY_MS = 'DSH_CHANNEL_PACK_AUTO_CHE
 
 /** 默认延迟（毫秒）。理由见文件头「为什么延迟 30 秒」。 */
 export const AUTO_CHECKIN_DELAY_MS = 30_000
+
+/**
+ * 常驻进程的跨天巡检间隔（毫秒，默认 2.5 小时）。
+ *
+ * 启动补跑只覆盖「当天第一次启动」；独立服务会连续运行多天，必须有跨天触发点。
+ * 巡检只做日期比较，真正的判断与在飞去重都在 `runIfDue()` 里，成本可以忽略；
+ * 过零点后最多晚 2.5 小时签到。
+ */
+export const AUTO_CHECKIN_TICK_MS = 150 * 60 * 1000
+
+/**
+ * 今天尝试过、但没有任何渠道能证明「今天已被处理」时的重试间隔下限（毫秒）。
+ *
+ * 失败（凭据过期 / 网络）时 `runIfDue()` 不记 `lastDate`，会随巡检自然重试。
+ * 该值是**下限保护**：巡检间隔（默认 2.5 小时）不小于它时不生效；只有巡检被
+ * 自定义调小到 1 小时以内时，才用它拦住「每 15 分钟打一轮上游」的高频重试。
+ */
+export const AUTO_CHECKIN_RETRY_MS = 60 * 60 * 1000
 
 /**
  * 读延迟配置。
@@ -307,9 +315,6 @@ function emptyTotals(): RunTotals {
 }
 
 /**
- * 「不支持每日签到」的判据：`credits.claimAll` 对 cline / raccoon / workbuddy
- * 返回的**显式**错误文案（这三条分支都不发上游请求）。
- *
  * ⚠️ 兜底认 `unsupported provider`：那是 `productById` 找不到产品时的文案，
  * 语义同样是「这个渠道没有可用的签到实现」，计成失败只会制造假警报。
  * ⚠️ 判据必须**窄**：只匹配这两个短语，不要泛化成「含 unsupported」之类，
@@ -323,10 +328,6 @@ export function isUnsupportedCheckin(message: string): boolean {
  * ⚠️ **自动签到不适合**的渠道：领取过程需要**用户在场 / 外部程序**。
  *
  * ## 为什么不靠「错误文案」判（真实缺陷，2026-10-02 审查 PR !33 定位）
- *
- * 本文件原先的规则是「判据交给 `credits.claimAll` 自己：不支持的渠道会
- * **不发上游请求**就返回错误」。那对 cline / raccoon / workbuddy 成立 ——
- * 它们的守卫在 `claimAll` 里，返回前一个请求都没发。
  *
  * 但**漏了一类**：zcode **有**签到，只是每次领取都要现场产一个阿里云
  * captcha param（`channel-pack-rpc.ts` 的 zcode 分支无条件调 `zcode.mintCaptcha`）。
@@ -458,6 +459,9 @@ export interface AutoCheckinDeps {
   delayMs?: number
   /** 排定延迟执行（注入以便单测零等待）。返回值交给 `stop()` 取消。 */
   schedule?(fn: () => void, ms: number): { cancel(): void }
+  /** 跨天巡检间隔，0 表示关闭。 */
+  tickMs?: number
+  scheduleTick?(fn: () => void, ms: number): { cancel(): void }
   warn?(message: string): void
 }
 
@@ -492,6 +496,10 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
   let inflight: Promise<void> | null = null
   let pending: { cancel(): void } | null = null
 
+  let tick: { cancel(): void } | null = null
+  // Attempt time also covers failures that intentionally do not mark today.
+  let lastAttemptAt = doc.lastAt
+
   const today = (): string => utc8DateString(now())
 
   function state(): RpcUsageAutoCheckinState {
@@ -509,6 +517,7 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
   }
 
   async function performRun(): Promise<void> {
+    lastAttemptAt = now()
     const totals = emptyTotals()
     let providers: string[] = []
     try {
@@ -627,7 +636,7 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       return state()
     },
     start() {
-      if (pending !== null) return
+      if (pending !== null || tick !== null) return
       const ms = deps.delayMs ?? autoCheckinDelayMs()
       const fire = (): void => {
         pending = null
@@ -636,9 +645,23 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       // 延迟为 0 = 立刻跑（单测的默认形态，也是用户把环境变量设成 0 时的语义）。
       if (ms <= 0) {
         fire()
-        return
+      } else {
+        pending = (deps.schedule ?? defaultSchedule)(fire, ms)
       }
-      pending = (deps.schedule ?? defaultSchedule)(fire, ms)
+      // 独立服务会常驻多天：启动补跑只覆盖「当天第一次启动」，跨天必须有巡检，
+      // 否则过了零点就再没有触发点（2026-10-27 实测：进程从 10-25 起未重启，
+      // 10-26 的记录是手动点的，10-27 一整天没有自动签到）。
+      // 开关 / 今天是否已跑 / 在飞去重都收敛在 `runIfDue()`；这里只多做一层
+      // 失败退避下限，拦住「巡检被调小后高频打上游」的情况。
+      const tickMs = deps.tickMs ?? AUTO_CHECKIN_TICK_MS
+      if (tickMs > 0) {
+        tick = (deps.scheduleTick ?? defaultScheduleTick)(() => {
+          if (doc.lastDate !== '' && doc.lastDate === today()) return
+          const attemptedToday = lastAttemptAt > 0 && utc8DateString(lastAttemptAt) === today()
+          if (attemptedToday && now() - lastAttemptAt < AUTO_CHECKIN_RETRY_MS) return
+          void runIfDue()
+        }, tickMs)
+      }
     },
     runIfDue,
     async dismiss() {
@@ -655,6 +678,8 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
     stop() {
       pending?.cancel()
       pending = null
+      tick?.cancel()
+      tick = null
     },
   }
 }
@@ -669,4 +694,14 @@ function defaultSchedule(fn: () => void, ms: number): { cancel(): void } {
   const timer = setTimeout(fn, ms)
   timer.unref?.()
   return { cancel: () => clearTimeout(timer) }
+}
+/**
+ * 默认跨天巡检排定：`setInterval` + `unref()`。
+ *
+ * `unref()` 的理由同 `defaultSchedule`：巡检定时器不能拖住宿主进程退出。
+ */
+function defaultScheduleTick(fn: () => void, ms: number): { cancel(): void } {
+  const timer = setInterval(fn, ms)
+  timer.unref?.()
+  return { cancel: () => clearInterval(timer) }
 }

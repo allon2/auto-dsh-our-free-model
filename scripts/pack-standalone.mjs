@@ -22,21 +22,61 @@ const sourceFiles = [
   'packages/standalone/cli.mjs',
   'packages/standalone/service.mjs',
   'packages/standalone/management.mjs',
+  'packages/standalone/desktop-update.mjs',
   'packages/standalone/login-terminal.mjs',
+  'packages/standalone/open-external.mjs',
   'packages/standalone/eac.mjs',
+  'packages/standalone/workbench.mjs',
+  'packages/standalone/client-terminal.mjs',
+  'packages/standalone/providers.mjs',
+  'packages/standalone/library.mjs',
+  'packages/standalone/routing.mjs',
+  'packages/standalone/feedback.mjs',
   ...['business', 'contracts', 'credentials', 'images', 'runtime', 'worker']
     .map(name => `packages/standalone/channels/${name}.mjs`),
-  ...['index.html', 'app.js', 'app.css', 'channels.js', 'channels.css']
-    .map(name => `packages/standalone/web/${name}`),
-  ...['adapter', 'catalog', 'channel', 'eac', 'eac-login', 'eac-user', 'effort',
-    'egress', 'forward', 'http', 'kilo', 'messages', 'probe', 'recovery',
-    'store', 'stream', 'trust', 'upstream', 'vault', 'vault-data', 'vault-anchor']
+  'packages/standalone/web/index.html',
+  'packages/standalone/web/assets.json',
+  ...['adapter', 'aggregate', 'anthropic', 'catalog', 'channel', 'combos', 'disclaimer', 'eac', 'eac-login', 'eac-user', 'effort',
+    'egress', 'engine-payload', 'forward', 'gemini', 'http', 'kilo', 'local-optimize',
+    'loopback-fetch', 'magpie-engine', 'magpie-models', 'magpie-policy', 'messages', 'model-test', 'open-external', 'probe', 'recovery',
+    'store', 'stream', 'subscriptions', 'subscription-completion', 'subscription-adapter', 'token-saver', 'trust', 'upstream', 'vault', 'vault-data', 'vault-anchor']
     .map(name => `src/${name}.js`),
   ...['completion', 'runtime', 'stats'].map(name => `src/core/${name}.js`),
+  'src/core.js',
+  'src/bun-fetch.js',
+  // The opencode2api port the free lane's shaping layer delegates to
+  // (src/o2a/SYNC.md), shipped as the release bundle built by
+  // build-legacy-payload.mjs — the official assets are inlined into it.
+  'src/o2a.js',
+  // The extension platform the standalone service mounts like the plugin does
+  'src/extensions.js',
+  // The plugin kernel: manifest, scans, built-ins, page bridge, bundled shelf
+  'src/plugins.js',
+  // The semver helpers extensions.js imports (updater.js is not shipped here)
+  'src/semver.js',
+  'src/providers/index.js',
+  'src/providers/registry.json',
+  'src/route/classify.js',
+  ...['index', 'inject', 'prompts'].map(name => `src/token-saver/${name}.js`),
+  ...['index', 'constants', 'autodetect', 'applyFilter', 'hitLine', 'registry']
+    .map(name => `src/token-saver/compact/${name}.js`),
+  ...['buildOutput', 'dedupLog', 'find', 'gitDiff', 'gitLog', 'gitStatus', 'grep', 'ls',
+    'readNumbered', 'searchList', 'smartTruncate', 'tree']
+    .map(name => `src/token-saver/compact/filters/${name}.js`),
   'vendor/channel-pack/qoder-auth-wasm.wasm',
   'vendor/channel-pack/LICENSE',
   'vendor/channel-pack/NOTICE.md',
 ].sort()
+
+export function standaloneSourceFiles() {
+  const assets = JSON.parse(regularBytes(path.join(repositoryRoot, 'packages/standalone/web/assets.json')))
+  if (!Array.isArray(assets) || assets.length === 0
+    || assets.some(name => typeof name !== 'string' || !/^[A-Za-z0-9_-]+\.(?:js|css)$/.test(name))
+    || new Set(assets).size !== assets.length) {
+    throw new Error('The standalone web asset manifest must list unique JS/CSS filenames')
+  }
+  return [...sourceFiles, ...assets.map(name => `packages/standalone/web/${name}`)].sort()
+}
 
 function regularBytes(file) {
   if (!fs.lstatSync(file).isFile()) throw new Error(`Only regular files can be packaged: ${file}`)
@@ -73,7 +113,7 @@ export function buildStandalonePackage({ nodeExecutable = process.execPath, node
   if (linked.length === 0 || linked.some(file => !file.startsWith('/usr/lib/') && !file.startsWith('/System/Library/'))) {
     throw new Error('Node depends on non-system libraries; use a self-contained Node distribution')
   }
-  const sources = sourceFiles.map(file => ({ file, bytes: regularBytes(path.join(repositoryRoot, file)) }))
+  const sources = standaloneSourceFiles().map(file => ({ file, bytes: regularBytes(path.join(repositoryRoot, file)) }))
   const product = JSON.parse(sources.find(item => item.file === 'packages/standalone/package.json').bytes)
   const sourceDigest = hash(Buffer.concat(sources.flatMap(({ file, bytes }) => [Buffer.from(`${file}\0${bytes.length}\0`), bytes])))
   const nodeDigest = hash(binary)

@@ -1,5 +1,8 @@
 import { ROUTE_MAIN, ROUTE_REGION } from '../adapter.js'
 import { toOpenAiUsage } from '../forward.js'
+import { carryFailure } from '../http.js'
+import { effortsFor, defaultEffortFor } from '../effort.js'
+import { flattenResponsesTools, flatNamespaceToolName, normalizeToolName } from '../messages.js'
 
 export function routableModelIds(snapshot) {
   const membership = new Set(snapshot.membership[ROUTE_MAIN] ?? [])
@@ -13,11 +16,18 @@ export function publicModelRows(snapshot) {
   const membership = routableModelIds(snapshot)
   return snapshot.catalog
     .filter(entry => membership.has(entry.id))
-    .map(entry => ({
-      id: entry.id, object: 'model',
-      created: Math.floor(Date.now() / 1000), owned_by: 'our-free-model',
-      ...entry.contextWindow === undefined ? {} : { context_window: entry.contextWindow },
-    }))
+    .map(entry => {
+      const efforts = effortsFor(entry, undefined, snapshot.settings.defaultMaxTokens)
+      return {
+        id: entry.id, object: 'model',
+        created: Math.floor(Date.now() / 1000), owned_by: 'our-free-model',
+        ...entry.contextWindow === undefined ? {} : { context_window: entry.contextWindow },
+        ...efforts === undefined ? {} : {
+          x_ofm_efforts: efforts.map(effort => effort.id),
+          x_ofm_effort_default: defaultEffortFor(entry),
+        },
+      }
+    })
 }
 
 /** 固定本次请求的模型和配置快照，两个入口使用同一条推理链路。 */
@@ -41,15 +51,16 @@ export function createForwardCompletion({ adapter, state, signal }) {
       : fromOpenAiMessages(openAi, request.responses === true, entry.id)
     const tools = Array.isArray(request.tools)
       ? request.tools
-      : (openAi.tools ?? []).map(normalizeTool).filter(Boolean)
+      : flattenResponsesTools(openAi.tools).tools
     const handler = typeof onChunk === 'function' ? onChunk : () => {}
-    const outcome = { text: '', toolCalls: [], usage: undefined, truncated: false, error: undefined }
+    const outcome = { text: '', reasoning: '', toolCalls: [], usage: undefined, truncated: false, error: undefined }
     const maxTokens = Number.isFinite(request.maxTokens) ? request.maxTokens
       : Number.isFinite(openAi.max_tokens) ? openAi.max_tokens : undefined
     const temperature = Number.isFinite(request.temperature) ? request.temperature
       : Number.isFinite(openAi.temperature) ? openAi.temperature : undefined
     const reasoningEffort = typeof request.reasoningEffort === 'string' ? request.reasoningEffort
       : typeof openAi.reasoning_effort === 'string' ? openAi.reasoning_effort : undefined
+    const toolChoice = request.toolChoice === undefined ? openAi.tool_choice : request.toolChoice
     const options = {
       provider: ROUTE_MAIN, model: entry.id,
       messages,
@@ -57,6 +68,7 @@ export function createForwardCompletion({ adapter, state, signal }) {
       ...temperature === undefined ? {} : { temperature },
       ...maxTokens === undefined ? {} : { maxTokens },
       ...reasoningEffort === undefined ? {} : { reasoningEffort },
+      ...toolChoice === undefined ? {} : { toolChoice },
       sessionId: `forward:${String(openAi.user ?? openAi.conversation ?? request.sessionId ?? 'shared')}`,
       signal: request.signal && signal ? AbortSignal.any([request.signal, signal]) : request.signal ?? signal,
     }
@@ -107,6 +119,9 @@ export function fromOpenAiMessages(body, isResponses, modelId) {
     out.push({
       role: role === 'developer' ? 'developer' : role === 'system' ? 'system' : role === 'assistant' ? 'assistant' : 'user',
       content,
+      ...(role === 'assistant' && typeof row.reasoning_content === 'string'
+        ? { reasoning_content: row.reasoning_content }
+        : {}),
       ...role === 'assistant' ? { source: { kind: 'model', provider: ROUTE_MAIN, model: String(modelId ?? '') } } : {},
     })
   }
@@ -118,22 +133,21 @@ function normaliseResponsesInput(input) {
   if (!Array.isArray(input)) return []
   return input.map(row => {
     if (typeof row === 'string') return { role: 'user', content: row }
-    if (row.type === 'function_call') return { role: 'assistant', content: [], tool_calls: [{ id: row.call_id, function: { name: row.name, arguments: row.arguments } }] }
+    if (row.type === 'function_call') {
+      const bare = normalizeToolName(row.name) ?? ''
+      const ns = normalizeToolName(row.namespace)
+      const name = bare !== '' && ns !== undefined ? flatNamespaceToolName(ns, bare) : (row.name ?? '')
+      return { role: 'assistant', content: [], tool_calls: [{ id: row.call_id, function: { name, arguments: row.arguments } }] }
+    }
     if (row.type === 'function_call_output') return { role: 'tool', content: String(row.output ?? ''), tool_call_id: row.call_id }
     return row
   })
 }
 
-function normalizeTool(tool) {
-  const name = tool?.name ?? tool?.function?.name
-  if (typeof name !== 'string' || name.trim() === '') return null
-  const parameters = tool?.parameters ?? tool?.function?.parameters ?? { type: 'object', properties: {} }
-  return { name, description: String(tool?.description ?? tool?.function?.description ?? ''), parameters }
-}
-
 export function foldForwardOutcome(outcome, chunk) {
   switch (chunk.type) {
     case 'text-delta': outcome.text += chunk.text; break
+    case 'reasoning-delta': outcome.reasoning = (outcome.reasoning ?? '') + chunk.text; break
     case 'tool-call-delta': {
       let call = outcome.toolCalls.find(candidate => candidate.slot === chunk.index)
       if (call === undefined) { call = { slot: chunk.index, id: chunk.id ?? '', name: chunk.name ?? '', arguments: chunk.argumentsDelta ?? '' }; outcome.toolCalls.push(call) }
@@ -171,7 +185,10 @@ export function foldForwardOutcome(outcome, chunk) {
     case 'usage': outcome.usage = toOpenAiUsage(chunk.usage); break
     case 'finish':
       if (chunk.reason?.kind === 'max-tokens') outcome.truncated = true
-      if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') outcome.error = chunk.reason.failure?.message
+      if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') {
+        outcome.failure = carryFailure(chunk.reason.failure, chunk.reason.kind)
+        outcome.error = outcome.failure.message
+      }
       break
     default: break
   }

@@ -1,3 +1,14 @@
+/*!
+ * Vendored from 9router (https://github.com/decolua/9router, MIT,
+ * Copyright (c) 2024-2026 decolua and contributors), upstream file ".probe3.mjs".
+ *
+ * This is a byte-for-byte copy with the upstream base URL changed to the endpoint
+ * this plugin probes. It is kept as evidence for the findings in README.md, not as
+ * shipped code, and it imports 9router's own modules, so it does not run outside a
+ * 9router checkout.
+ *
+ * MIT licence text: LICENSE, section "9router".
+ */
 import { generateSessionId, generateRequestId } from "./open-sse/executors/opencode.js";
 import { applyFingerprintTools } from "./open-sse/utils/opencodeFingerprint.js";
 import { writeFileSync } from "fs";
@@ -44,9 +55,9 @@ const FREE = [
   "ling-3.0-flash-fin-free", "nemotron-3-ultra-free", "nemotron-3.5-lightning-free",
   "space-bunny-free", "jev-1.13-free",
 ];
-for (const m of FREE) await probe("chat", `${B}/zen/v1/chat/completions`, m, chatBody(m));
-await probe("messages", `${B}/zen/v1/messages`, "union-alpha", msgBody("union-alpha"), { "anthropic-version": "2023-06-01" });
-await probe("responses", `${B}/zen/v1/responses`, "muse-spark-1.3-contributor-free", respBody("muse-spark-1.3-contributor-free"));
-await probe("responses", `${B}/zen/v1/responses`, "muse-spark-1.2-contributor-free", respBody("muse-spark-1.2-contributor-free"));
+for (const m of FREE) await probe("chat", `${B}/inference/v1/chat/completions`, m, chatBody(m));
+await probe("messages", `${B}/inference/v1/messages`, "union-alpha", msgBody("union-alpha"), { "anthropic-version": "2023-06-01" });
+await probe("responses", `${B}/inference/v1/responses`, "muse-spark-1.3-contributor-free", respBody("muse-spark-1.3-contributor-free"));
+await probe("responses", `${B}/inference/v1/responses`, "muse-spark-1.2-contributor-free", respBody("muse-spark-1.2-contributor-free"));
 
 writeFileSync(".probe-results.json", JSON.stringify(results, null, 2));

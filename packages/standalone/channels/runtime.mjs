@@ -8,7 +8,6 @@ export async function createChannelRuntime({ dataDir, logger = console, stats })
   const worker = new Worker(new URL('./worker.mjs', import.meta.url), {
     workerData: { dataDir },
     execArgv: process.execArgv.filter(arg => !arg.startsWith('--input-type')),
-    env: { ...process.env, OFM_CODEARTS_CACHE_DIR: path.join(dataDir, 'channel-pack', 'codearts-cache') },
   })
   const pending = new Map()
   let sequence = 0
@@ -69,10 +68,11 @@ export async function createChannelRuntime({ dataDir, logger = console, stats })
       worker.postMessage({ type, id, ...payload })
     })
   }
-  function refresh() {
-    if (refreshing) return refreshing
-    refreshing = call('models').then(value => { rows = value; return rows }).finally(() => { refreshing = undefined })
-    return refreshing
+  function refresh({ report = false } = {}) {
+    if (!refreshing) {
+      refreshing = call('models').then(value => { rows = value.rows; return value }).finally(() => { refreshing = undefined })
+    }
+    return report ? refreshing : refreshing.then(value => value.rows)
   }
   const runtime = {
     get providers() { return providers },
@@ -85,7 +85,7 @@ export async function createChannelRuntime({ dataDir, logger = console, stats })
       return call('rpc', { call: { method: body.method, payload: body.payload } }, signal, undefined, 10 * 60000)
     },
     async complete(request, onChunk) {
-      const outcome = { text: '', toolCalls: [], usage: undefined, truncated: false, error: undefined }
+      const outcome = { text: '', reasoning: '', toolCalls: [], usage: undefined, truncated: false, error: undefined }
       const started = Date.now()
       let first = 0
       let ok = false

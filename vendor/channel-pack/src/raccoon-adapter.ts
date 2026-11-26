@@ -1,3 +1,5 @@
+import { withQueueAccountRotation } from './queue-rotation.js'
+import { checkQueuedResponse } from './model-queue.js'
 /**
  * Raccoon Work LLM 适配器。
  *
@@ -32,6 +34,8 @@ import type {
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
+import { nextUtc8DayStartMs } from './model-queue.js'
+import { retryAfterMsFromResponse } from './retry-after.js'
 import { isRaccoonExpired, type RaccoonCredential } from './raccoon.js'
 import {
   RACCOON,
@@ -58,6 +62,62 @@ import {
 
 /** 本适配器注册的 provider 路由名（等价于 `RACCOON.id`）。 */
 export const PROVIDER = 'raccoon'
+
+/**
+ * 429（短时频率限制）的默认冷却。
+ *
+ * issue #782 的抓包里 429 **通常不带 Retry-After**，只给
+ * `{"error":{"code":"user_model_rate_limited",...}}`；没有头时按 60 秒冷却，
+ * 既能让当前账号立即让位给备用号，又不会像 402 那样锁到次日。
+ */
+const RATE_LIMIT_DEFAULT_COOLDOWN_MS = 60_000
+
+/**
+ * 429 冷却上限（15 分钟）。
+ *
+ * Retry-After 是外部输入：一个写错年份的 HTTP 日期或异常大的秒数会把账号
+ * 锁上几小时/几天，反而让「短时限流」变成事实上的封号。
+ */
+const RATE_LIMIT_MAX_COOLDOWN_MS = 15 * 60_000
+
+/**
+ * 从 429 响应头解析冷却时长（秒数或 HTTP 日期）→ 毫秒。
+ *
+ * 解析规则收敛在 `retry-after.ts`（`0` 是合法值，判空必须用 `=== undefined`）。
+ * 这里额外把非正数视为「没有可用的等待时长」：`0` 秒写进限流表等于不冷却，
+ * 当前账号会在下一次选号时被立刻重选；且 `LlmError.providerRetryAfterMs`
+ * 只接受正整数。
+ */
+function rateLimitCooldownFromHeaders(headers: { get(name: string): string | null }): number {
+  const parsed = retryAfterMsFromResponse(headers)
+  const requested = parsed !== undefined && parsed > 0 ? parsed : RATE_LIMIT_DEFAULT_COOLDOWN_MS
+  return Math.min(requested, RATE_LIMIT_MAX_COOLDOWN_MS)
+}
+
+/**
+ * 从 429 错误取出冷却时长。
+ *
+ * 走 `LlmError.failure.providerRetryAfterMs`（dsh-llm 的官方契约字段，
+ * 不是展开在 error 自身）；缺失或非法时退回 60 秒，并统一夹到上限。
+ */
+function rateLimitCooldownFromError(error: LlmError): number {
+  // 可选链是防御：宿主/测试替身可能只实现了 `code` 与 `status`。
+  const requested = error.failure?.providerRetryAfterMs
+  if (requested === undefined || !Number.isFinite(requested) || requested <= 0) {
+    return RATE_LIMIT_DEFAULT_COOLDOWN_MS
+  }
+  return Math.min(requested, RATE_LIMIT_MAX_COOLDOWN_MS)
+}
+
+function isQuotaError(data: Record<string, unknown>): boolean {
+  const error = typeof data.error === 'object' && data.error !== null
+    ? data.error as Record<string, unknown>
+    : data
+  return String(error.code ?? data.code) === '402'
+    || /积分不足|余额不足|insufficient[_\s]+(?:points|balance|credits)/i.test(
+      String(error.message ?? error.msg ?? ''),
+    )
+}
 
 /**
  * 把 DSH 的档位 id 映射成请求体的 `extra_body.thinking` 字段。
@@ -167,7 +227,12 @@ export interface RaccoonAdapterOptions {
   /** 解析当前可用凭据。 */
   resolveCredential: (modelId?: string) => Promise<RaccoonCredential | undefined>
   /** 凭据失效时的处理（raccoon 有 refresh 端点，会真续期）。 */
-  refresh: () => Promise<void>
+  refresh: (accountId?: string, reason?: 'auth') => Promise<RaccoonCredential | void>
+  /** Request-local rotation; callers must exclude already attempted accounts. */
+  nextAccount?: (
+    modelId: string,
+    tried: ReadonlySet<string>,
+  ) => Promise<{ accountId: string; credential: RaccoonCredential } | undefined>
   /** 拉取远端模型目录；失败时适配器回退兜底表。 */
   fetchRemoteModels?: () => Promise<RaccoonRemoteModel[]>
   /** 读取图片附件的原始字节（内联为 data URL 用）。 */
@@ -367,9 +432,11 @@ export class RaccoonAdapter extends LlmAdapter {
 
     // 1. 取凭据（过期则先续期）
     let credential = await this.options.resolveCredential(options.model)
+    let accountId = credential === undefined ? undefined
+      : await this.options.accountPool?.findAccountIdByCredential(this.product.id, credential.access_token)
     if (credential === undefined || isRaccoonExpired(credential)) {
-      await this.options.refresh()
-      credential = await this.options.resolveCredential(options.model)
+      credential = await this.options.refresh(accountId || undefined)
+        ?? await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('raccoon: no usable credential; log in first', 'MISSING_CREDENTIAL')
@@ -442,7 +509,7 @@ export class RaccoonAdapter extends LlmAdapter {
             body: buildBody(),
             signal: options.signal,
           },
-        )
+        ).then(checkQueuedResponse)
       } catch (error) {
         if (options.signal?.aborted) throw error
         if (isTransportError(error)) {
@@ -456,30 +523,84 @@ export class RaccoonAdapter extends LlmAdapter {
       }
     }
 
-    let response = await send()
-    // 401/403 时续期一次并重试（raccoon 有 refresh_token 轮换）。
-    if (response.status === 401 || response.status === 403) {
-      await this.options.refresh()
-      const refreshed = await this.options.resolveCredential(options.model)
-      if (refreshed === undefined || refreshed.access_token.length === 0) {
-        throw new LlmError('raccoon: credential expired and refresh failed', 'AUTH', { status: response.status })
+    const tried = new Set<string>()
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (accountId) tried.add(accountId)
+      let emitted = false
+      try {
+        let response = await send()
+        if (response.status === 401 || response.status === 403) {
+          await response.body?.cancel()
+          const refreshed = await this.options.refresh(accountId || undefined, 'auth')
+            ?? await this.options.resolveCredential(options.model)
+          if (refreshed === undefined || refreshed.access_token.length === 0) {
+            throw new LlmError('raccoon: credential expired and refresh failed', 'AUTH', { status: response.status })
+          }
+          credential = refreshed
+          response = await send()
+        }
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => '')
+          let quota = response.status === 402
+          try { quota ||= isQuotaError(JSON.parse(errorText)) } catch {}
+          /**
+           * 429 = 短时频率限制（不是当日额度耗尽）。
+           *
+           * 上游实测形态见 issue #782：
+           * `{"error":{"code":"user_model_rate_limited",
+           * "message":"您的模型请求频率超限，请稍后重试","type":"rate_limit_error"}}`。
+           * 把它带成 `RATE_LIMIT` 后，下面的 catch 会给当前账号记短冷却并换号。
+           * `Retry-After`（秒数或 HTTP 日期）是首选；没有就 60s，并夹到 15min。
+           */
+          const retryAfterMs = !quota && response.status === 429
+            ? rateLimitCooldownFromHeaders(response.headers)
+            : undefined
+          throw new LlmError(
+            `raccoon: ${errorDetail(errorText)}`,
+            quota ? 'QUOTA_EXCEEDED' : httpErrorCode(response.status),
+            {
+              status: response.status,
+              ...retryAfterMs === undefined ? {} : { providerRetryAfterMs: retryAfterMs },
+            },
+          )
+        }
+        for await (const chunk of consumeOpenAiSse(response, { signal: options.signal }, {
+          label: 'raccoon',
+          firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
+          chunkTimeoutMs: resolveChunkTimeoutMs(),
+          isQuotaError,
+          ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+        })) {
+          emitted = true
+          yield chunk
+        }
+        return
+      } catch (error) {
+        if (options.signal?.aborted || !(error instanceof LlmError)) throw error
+        const quota = error.code === 'QUOTA_EXCEEDED'
+        // 429/RATE_LIMIT 与 402/QUOTA_EXCEEDED 都参与换号，但冷却语义不能混用：
+        // 前者是短时限流（Retry-After 或 60s），后者是当日额度耗尽（次日 UTC+8 零点）。
+        if (!quota && error.code !== 'RATE_LIMIT') throw error
+        if (accountId) {
+          await this.options.accountPool?.updateModelRateLimit(
+            accountId,
+            options.model,
+            quota ? nextUtc8DayStartMs() : Date.now() + rateLimitCooldownFromError(error),
+          )
+        }
+        // A new SSE consumer starts block indices at zero; never replay after output.
+        // 没有备用号时原样抛出 429 的 RATE_LIMIT（status / providerRetryAfterMs 都在），
+        // 由宿主按可重试处理；不能改写成不可重试的 QUOTA_EXCEEDED。
+        if (emitted || attempt === 2 || this.options.nextAccount === undefined) throw error
+        const next = await this.options.nextAccount(options.model, tried)
+        if (next === undefined || tried.has(next.accountId)) throw error
+        accountId = next.accountId
+        credential = next.credential
+        if (isRaccoonExpired(credential)) {
+          credential = await this.options.refresh(accountId) ?? credential
+        }
       }
-      credential = refreshed
-      response = await send()
     }
-
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      throw new LlmError(`raccoon: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
-    }
-
-    // ⚠️ 业务失败也可能以 HTTP 200 + SSE 内嵌错误帧返回，由 consumeOpenAiSse 处理。
-    yield* consumeOpenAiSse(response, { signal: options.signal }, {
-      label: 'raccoon',
-      firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
-      chunkTimeoutMs: resolveChunkTimeoutMs(),
-      ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
-    })
   }
 }
 
@@ -504,7 +625,7 @@ function resolveChunkTimeoutMs(): number {
  */
 export function registerRaccoonLlm(ctx: Context, options: RaccoonAdapterOptions): RaccoonAdapter {
   const product = options.product ?? RACCOON
-  const adapter = new RaccoonAdapter(options)
+  const adapter = withQueueAccountRotation(product.id, options, scoped => new RaccoonAdapter(scoped))
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }

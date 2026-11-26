@@ -1,3 +1,14 @@
+/*!
+ * Vendored from 9router (https://github.com/decolua/9router, MIT,
+ * Copyright (c) 2024-2026 decolua and contributors), upstream file ".probe2.mjs".
+ *
+ * This is a byte-for-byte copy with the upstream base URL changed to the endpoint
+ * this plugin probes. It is kept as evidence for the findings in README.md, not as
+ * shipped code, and it imports 9router's own modules, so it does not run outside a
+ * 9router checkout.
+ *
+ * MIT licence text: LICENSE, section "9router".
+ */
 import { generateSessionId, generateRequestId } from "./open-sse/executors/opencode.js";
 import { applyFingerprintTools } from "./open-sse/utils/opencodeFingerprint.js";
 
@@ -30,7 +41,7 @@ async function chat(model) {
   };
   applyFingerprintTools(body, false);
   const t0 = Date.now();
-  const res = await fetch(`${B}/zen/v1/chat/completions`, {
+  const res = await fetch(`${B}/inference/v1/chat/completions`, {
     method: "POST",
     headers: { ...HEADERS, "x-opencode-request": generateRequestId() },
     body: JSON.stringify(body),
@@ -51,7 +62,7 @@ async function responses(model) {
   };
   applyFingerprintTools(body, true);
   const t0 = Date.now();
-  const res = await fetch(`${B}/zen/v1/responses`, {
+  const res = await fetch(`${B}/inference/v1/responses`, {
     method: "POST",
     headers: { ...HEADERS, "x-opencode-request": generateRequestId() },
     body: JSON.stringify(body),

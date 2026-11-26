@@ -42,6 +42,15 @@ const checkThat = (name, condition, detail = '') => {
   console.log(`${condition ? 'ok  ' : 'FAIL'} ${name}${condition ? '' : ` — ${detail}`}`)
 }
 
+/** Text visible in either a legacy string or the kernel's typed content blocks. */
+const wireText = content => {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map(block => typeof block === 'string' ? block : typeof block?.text === 'string' ? block.text : '')
+    .join('\n')
+}
+
 /** A big, obviously-compressible tool result: a real `git diff` shape. */
 const BIG_DIFF = [
   'diff --git a/src/app.js b/src/app.js',
@@ -79,7 +88,7 @@ const refusingServer = http.createServer((req, res) => {
   req.on('end', () => {
     let body = {}
     try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch { /* scripted failure */ }
-    refusingRequests.push({ path: url, body })
+    refusingRequests.push({ path: url, body, headers: { ...req.headers } })
     res.writeHead(429, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ error: { message: 'rate limit exceeded', type: 'rate_limit_error' } }))
   })
@@ -129,6 +138,10 @@ fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({
   }],
 }))
 
+// Dynamic on purpose: upstream.js pins `UPSTREAM_BASE` from the environment at
+// module level, so it must evaluate after the stub base is exported, exactly
+// the order index.js's own import gives it.
+const up = await import('../src/upstream.js')
 const { apply, inject } = await import('../index.js')
 const routes = []
 const ctx = fakeContext({ inject, mounted: ['llm', 'webServer', 'timer', 'connection', 'attachments'], onRegister: route => routes.push(route) })
@@ -152,7 +165,7 @@ const post = (url, body) => callRoute(api(), 'POST', `/api/our-free-model${url}`
   checkThat('an aggregate row reached the catalog', aggregate !== undefined, [...byId.keys()].join(', '))
   check('the aggregate row names its lane', aggregate?.channel, 'aggregate')
   check('and carries its provider and model separately', [aggregate?.providerId, aggregate?.modelId], ['open_router', 'alpha-model'])
-  check('an aggregate row is not reported as unprobed-unknown', aggregate?.availability, 'available')
+  check('a listed aggregate row is not presented as verified', [aggregate?.availabilitySource, aggregate?.availability], ['listing', 'unknown'])
 
   const keyless = byId.get('groq/llama-3.3-70b-versatile')
   checkThat('a provider with no key contributes no row', keyless === undefined, 'a keyless apiKey provider was advertised')
@@ -165,7 +178,7 @@ const post = (url, body) => callRoute(api(), 'POST', `/api/our-free-model${url}`
   // the aggregate row 131072, so the chain must advertise the smaller of the two.
   check('the combo advertises the intersection window, not the largest', combo?.contextWindow, 128000)
   check('a combo whose links lack vision advertises no vision', combo?.vision, false)
-  check('a combo is not reported as unprobed-unknown', combo?.availability, 'available')
+  check('a listed combo is not presented as verified', [combo?.availabilitySource, combo?.availability], ['listing', 'unknown'])
   checkThat('the combo detail line names the chain', String(byId.get('combo:never-fails')?.detail ?? '').includes('chain') === false || true, '')
 }
 
@@ -188,14 +201,17 @@ const post = (url, body) => callRoute(api(), 'POST', `/api/our-free-model${url}`
   checkThat('the turn answered through the adapter', answer.includes('answered by the free lane'), JSON.stringify(chunks).slice(0, 300))
 
   await until(() => freeLane.requests.length > before, { what: 'the upstream request', timeoutMs: 5000 })
-  const sent = freeLane.requests[freeLane.requests.length - 1]
-  const toolRow = sent.body.messages.find(message => message.role === 'tool')
-  checkThat('the tool result was compacted on the wire', String(toolRow?.content ?? '').length < BIG_DIFF.length,
-    `sent ${String(toolRow?.content ?? '').length} bytes of ${BIG_DIFF.length}`)
-  checkThat('and the compaction kept the file header', String(toolRow?.content ?? '').includes('src/app.js'), String(toolRow?.content ?? '').slice(0, 200))
-  const system = sent.body.messages.find(message => message.role === 'system')
-  checkThat('the prompt saver injected a system instruction', String(system?.content ?? '').includes('<!-- ofm-token-saver -->'),
-    String(system?.content ?? '').slice(0, 200))
+  const sent = freeLane.requests.slice(before).find(request => request.body?.messages?.some(message => message.role === 'tool'))
+  checkThat('the captured request carries this turn’s tool result', sent !== undefined)
+  const toolRow = sent?.body.messages.find(message => message.role === 'tool')
+  const toolText = wireText(toolRow?.content)
+  checkThat('the tool result was compacted on the wire', toolText.length < BIG_DIFF.length,
+    `sent ${toolText.length} bytes of ${BIG_DIFF.length}`)
+  checkThat('and the compaction kept the file header', toolText.includes('src/app.js'), toolText.slice(0, 200))
+  const system = sent?.body.messages.find(message => message.role === 'system')
+  const systemText = wireText(system?.content)
+  checkThat('the prompt saver injected a system instruction', systemText.includes('<!-- ofm-token-saver -->'),
+    systemText.slice(0, 200))
 
   const stats = (await get('/stats')).json
   checkThat('the savings are counted', stats.savings?.saved > 0, JSON.stringify(stats.savings))
@@ -228,6 +244,11 @@ const post = (url, body) => callRoute(api(), 'POST', `/api/our-free-model${url}`
   checkThat('the second link answered', answer.includes('answered by the free lane'), answer)
   check('and the turn finished cleanly', finish?.reason?.kind, 'stop')
   checkThat('the free lane saw the retry', freeLane.requests.length > beforeFree, '')
+  check('the aggregate link sends its bare model id (#323)', refusing.requests.at(-1)?.body.model, 'alpha-model')
+  // The conversation's stable upstream session rides the aggregate link too, so
+  // a provider that keeps per-session state cannot merge this conversation with
+  // another one running on the same key (#532).
+  checkThat('the aggregate link carries the conversation session', up.isCanonicalSession(refusing.requests.at(-1)?.headers?.['x-session-id'] ?? ''), refusing.requests.at(-1)?.headers?.['x-session-id'])
 
   const stats = (await get('/stats')).json
   const comboRow = stats.models.find(row => row.model === 'combo:never-fails')
@@ -236,6 +257,38 @@ const post = (url, body) => callRoute(api(), 'POST', `/api/our-free-model${url}`
   check('not a failed turn', comboRow?.failedTurns, 0)
   const refuseRow = stats.models.find(row => row.model === 'open_router/alpha-model')
   checkThat('the refused link is still recorded physically', refuseRow !== undefined && refuseRow.failed > 0, JSON.stringify(refuseRow))
+}
+
+// ── 3b. the session dimension and its one-time warning (#532) ───────────────
+{
+  const firstSession = refusing.requests.at(-1)?.headers?.['x-session-id']
+  const warnLines = () => ctx.__logs.filter(line => line.includes('shares the reserved "global" upstream session')).length
+  // An id-less turn is the shape the reserved "global" session exists for. It
+  // must still answer, and it must say once — not on every title generation
+  // that follows — that such turns share one upstream session.
+  const warnedBefore = warnLines()
+  const idLess = {
+    provider: 'our-free-model',
+    model: 'deepseek-v4-flash-free',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+  }
+  const chunks = []
+  for await (const chunk of adapter.stream(idLess, null, undefined)) chunks.push(chunk)
+  checkThat('an id-less turn still answers', chunks.some(chunk => chunk.type === 'text-delta'), JSON.stringify(chunks).slice(0, 200))
+  check('and it warns once about the shared global session', warnLines(), warnedBefore + 1)
+  for await (const chunk of adapter.stream(idLess, null, undefined)) void chunk
+  check('and the second id-less turn stays quiet', warnLines(), warnedBefore + 1)
+  // A named conversation keeps the same upstream session across turns.
+  const beforeRefuse = refusing.requests.length
+  const again = {
+    provider: 'our-free-model',
+    model: 'combo:never-fails',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'again' }] }],
+    sessionId: 'wiring:combo',
+  }
+  for await (const chunk of adapter.stream(again, null, undefined)) void chunk
+  check('and a repeat of the same conversation keeps its session',
+    refusing.requests.slice(beforeRefuse).at(-1)?.headers?.['x-session-id'], firstSession)
 }
 
 // ── 4. the forward listener's Anthropic surface ──────────────────────────────
@@ -408,12 +461,20 @@ let boundPort = 0
   check('the combo editor answers', combos.status, 200)
   check('with the stored chain', combos.json.combos[0].id, 'combo:never-fails')
   checkThat('and a model list to pick from', combos.json.models.length >= 3, String(combos.json.models.length))
-  check('offering both strategies', combos.json.strategies, ['fallback', 'round-robin'])
+  check('offering supported routing strategies', combos.json.strategies, ['fallback', 'round-robin', 'smart', 'usage', 'pace'])
+  checkThat('model picker projection preserves context and output limits',
+    combos.json.models.every(row => Number.isFinite(row.contextWindow) && Number.isFinite(row.maxOutput)), 'missing capacity metadata')
+  const preview = await post('/combos/preview', { models: ['deepseek-v4-flash-free', 'mimo-v2.6-flash-free'] })
+  const picked = combos.json.models.filter(row => ['deepseek-v4-flash-free', 'mimo-v2.6-flash-free'].includes(row.id))
+  check('chain preview uses the runtime context intersection', preview.json.capacity.contextWindow, Math.min(...picked.map(row => row.contextWindow)))
+  check('chain preview uses the runtime output intersection', preview.json.capacity.maxOutput, Math.min(...picked.map(row => row.maxOutput)))
+  check('preview leaves stored chains untouched', (await get('/combos')).json.combos[0].id, 'combo:never-fails')
 
   const savedCombo = await post('/combos', { combos: [{ name: 'Second Chain', models: ['deepseek-v4-flash-free', 'mimo-v2.6-flash-free'], strategy: 'round-robin', stickyLimit: 2 }] })
   check('saving chains answers', savedCombo.status, 200)
   check('with the normalized id', savedCombo.json.combos[0].id, 'combo:second-chain')
   check('and the chosen strategy', savedCombo.json.combos[0].strategy, 'round-robin')
+  check('saved chains expose the same intersection as preview', savedCombo.json.usable[0].contextWindow, preview.json.capacity.contextWindow)
   checkThat('and the new chain is usable', (await summary()).json.catalog.some(entry => entry.id === 'combo:second-chain'), 'the new chain is not in the catalog')
 
   const saver = await get('/token-saver')

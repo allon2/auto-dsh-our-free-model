@@ -19,6 +19,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { restrictPermissions } from './open-external.js'
 
 /** Same resolution the harness home-paths helper uses: `$DSH_HOME` else `~/.dsh`. */
 export function resolveDshHome() {
@@ -63,7 +64,11 @@ export class JsonStore {
       // settings — the forward key, the acknowledged announcements — are gone with
       // nothing on disk to recover and nothing in the log to explain.
       try {
-        if (fs.existsSync(this.file)) fs.copyFileSync(this.file, `${this.file}.corrupt-${Date.now()}`)
+        if (fs.existsSync(this.file)) {
+          const backup = `${this.file}.corrupt-${Date.now()}`
+          fs.copyFileSync(this.file, backup)
+          restrictPermissions(backup)
+        }
       } catch { /* a home we cannot write to is not this file's problem */ }
     }
   }
@@ -108,6 +113,7 @@ export class JsonStore {
       fs.mkdirSync(path.dirname(this.file), { recursive: true })
       const temp = `${this.file}.${process.pid}.tmp`
       fs.writeFileSync(temp, JSON.stringify(this.value, undefined, 2), { mode: 0o600 })
+      restrictPermissions(temp)
       fs.renameSync(temp, this.file)
       this.writeFailed = false
     } catch (error) {
@@ -153,18 +159,51 @@ export const SETTINGS_INITIAL = {
   version: 1,
   /** Master switch: when off the routes stay registered but serve nothing. */
   enabled: true,
+  /** Allow installing unsigned local plugin packages from disk. Off by
+   *  default: the signed marketplace is the trust root, and a local package is
+   *  an explicit developer action with its own warning and badge. */
+  developerPlugins: false,
+  /** Install extension updates automatically once the registry tick runs and
+   *  the newer version has soaked past its supply-chain window (see
+   *  AUTO_UPDATE_SOAK_MS in src/extensions.js). Off by default: the update
+   *  badge is the prompt, the button is the decision. */
+  autoUpdateExtensions: false,
   /** Show region-limited models in the picker as soon as they answer. */
   exposeRegionModels: true,
-  /**
-   * Hide the absorbed channels' 13 provider groups from the model picker.
-   *
-   * Display only: the routes stay registered and keep serving the providers that
-   * reach them through the loopback gateway. Off by default so an upgrade never
-   * silently removes models from the picker.
-   */
+  /** Advertisement only: retain catalog entries and historical model resolution. */
+  hiddenModelIds: [],
+  hideFreeModels: false,
+  hideEacModels: false,
+  /** Fork: fold every channel pack group out of the catalog with one switch.
+   *  The pack's own gate keys on "has a logged-in account", which goes inert
+   *  once any credential resolves, and its remote catalog keeps adding models a
+   *  per-id blacklist cannot chase. Display only: routing never reads it. */
   hideChannelModels: false,
-  /** Minutes between background availability re-probes. */
+  /** Minutes between background catalog refreshes. Automatic availability
+   *  probing is disabled by owner policy; only the manual reprobe button sends
+   *  probe requests. Since 2.8.1 this cadence also cannot re-fetch the listing
+   *  more often than once a listing window (see src/core/runtime.js). */
   probeIntervalMinutes: 15,
+  /**
+   * The OpenCode lane's own exit pool (issue #708's method).
+   *
+   * The free tier's usage ceiling is counted per egress IP, so moving this
+   * lane's requests through another exit is the one lever that moves the
+   * counter. One address is not enough: a burned IP answers with a multi-hour
+   * `Retry-After`, and the lane needs somewhere to go within the same turn.
+   *
+   *   `proxies`  one address per entry; `http`/`https`/`socks5`/`socks5h`, and
+   *              a `#pool` (or `pool+`) suffix marks a rotating pool endpoint
+   *              that is never cooled. Empty means the global outlet when one
+   *              runs, then the HTTP(S)_PROXY environment, then direct.
+   *   `maxTries` how many distinct exits one request may walk.
+   *
+   * `proxyUrl` is the pre-pool single-address field, kept so an older settings
+   * file still works: it is folded into `proxies` when the list is empty.
+   * Nothing here rotates on its own — an exit is skipped only after the upstream
+   * said that exit is spent.
+   */
+  freeLane: { proxies: [], proxyUrl: '', maxTries: 3 },
   /** Serve the OpenAI-compatible forward listener for other local harnesses. */
   forward: {
     enabled: false,
@@ -206,12 +245,23 @@ export const SETTINGS_INITIAL = {
     providers: {},
   },
   /** Named fallback chains. A combo is a virtual model whose answer comes from
-   *  the first link that produces output; see src/combos.js. */
-  combos: [],
-  /** The built-in aggregate route `auto-free-model`: a chain the runtime
-   *  composes over every model the probe calls dialable, walked in order with
-   *  the same advance rules a manual combo uses. Switching it off removes the
-   *  row from the picker; the manual combos above are untouched. */
+   *  the first link that produces output; see src/combos.js.
+   *  Ships one sensible default so a fresh install shows a single "推荐免费组"
+   *  entry instead of a dozen free models; users can edit/disable it in settings. */
+  combos: [
+    {
+      id: 'combo:recommended-free',
+      name: '推荐免费组',
+      models: ['deepseek-v4.1-flash-free', 'glm-5.3-flash-free', 'space-bunny-free'],
+      strategy: 'fallback',
+      stickyLimit: 1,
+      enabled: true,
+    },
+  ],
+  /** The built-in aggregate route (`auto-free-model`). On by default: the
+   *  runtime composes its links from the models the latest verdicts call
+   *  dialable, so a fresh install routes through the free lane with no
+   *  configuration. `false` retires the row entirely. */
   autoChain: true,
   /** The five local answers that avoid a provider call entirely: a quota probe,
    *  a shell command prefix, a session title, a suggestion, a filepath list.
@@ -221,6 +271,8 @@ export const SETTINGS_INITIAL = {
   localOptimize: { enabled: true, quota: true, prefix: true, title: true, suggestion: true, filepath: true },
   /** Acknowledged announcement copy version. */
   announcementAck: '',
+  /** Acknowledged disclaimer copy version (src/disclaimer.js); 0 = not yet read. */
+  disclaimerAck: 0,
   /** Last full catalog refresh timestamp. */
   catalogSyncedAt: 0,
   /** Owner override for the announcement/update feed location. `{repo}` expands
@@ -228,6 +280,14 @@ export const SETTINGS_INITIAL = {
   feedUrl: '',
   /** Minutes between announcement-feed polls; floored at 5. */
   feedPollMinutes: 30,
+  /** Where the in-plugin feedback form submits. Empty keeps the built-in
+   *  project server; an override lets a self-hosting operator point at their
+   *  own collector. Feedback is never sent anywhere else. */
+  feedbackUrl: '',
+  /** GitHub login this install completed for the feedback form: `{ token,
+   *  login, at }`, or null. The token only authorizes feedback submission —
+   *  it is not an API credential and is never sent to a model endpoint. */
+  feedbackAuth: null,
   /** Raise OS-level notifications for new announcements and updates (the
    *  browser asks for permission on the user's click). */
   notifyOs: false,
@@ -248,8 +308,89 @@ export const SETTINGS_INITIAL = {
   /** When the running code was hot-reloaded into place, and how many times. */
   reloadedAt: 0,
   reloadCount: 0,
+  /** The `reloadedAt` the browser has already acknowledged. Stored here, not
+   *  in localStorage, so a new origin (another port or the desktop shell's
+   *  random port) does not replay the same notice. */
+  reloadNoticeSeen: 0,
   /** Version installed by the in-app upgrader, for the settings page. */
   installedVersion: '',
+}
+
+const validHiddenModelId = value => typeof value === 'string' && value.length > 0
+  && value.length <= 300 && value === value.trim() && !/[\u0000-\u001f\u007f]/.test(value)
+
+export function publicModelVisibility(settings) {
+  return {
+    hiddenModelIds: [...new Set((Array.isArray(settings?.hiddenModelIds) ? settings.hiddenModelIds : [])
+      .filter(validHiddenModelId))].slice(0, 1000),
+    hideFreeModels: settings?.hideFreeModels === true,
+    hideEacModels: settings?.hideEacModels === true,
+    hideChannelModels: settings?.hideChannelModels === true,
+  }
+}
+
+/** Reject the entire API patch before any setting is written. */
+export function validateModelVisibility(patch) {
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+    throw Object.assign(new TypeError('settings must be a JSON object'), { statusCode: 400 })
+  }
+  const result = {}
+  for (const key of ['hideFreeModels', 'hideEacModels', 'hideChannelModels', 'hiddenModelIds']) {
+    if (!Object.hasOwn(patch, key)) continue
+    const value = patch[key]
+    if (key === 'hiddenModelIds'
+      ? !Array.isArray(value) || value.length > 1000 || value.some(id => !validHiddenModelId(id))
+      : typeof value !== 'boolean') {
+      throw Object.assign(new TypeError(`${key} must be ${key === 'hiddenModelIds' ? 'an array of at most 1000 nonempty model ids (up to 300 characters each)' : 'a boolean'}`), { statusCode: 400 })
+    }
+    result[key] = Array.isArray(value) ? [...new Set(value)] : value
+  }
+  return result
+}
+
+/**
+ * Build one lookup index from a settings snapshot and the directory's family
+ * map. Stored ids are deduplicated in their original order. Only ids the
+ * directory has qualified enter a family bucket; every stored id remains
+ * available for exact matching, including rows absent from the current catalog.
+ */
+export function buildModelVisibility(settings, familyKeysById = new Map()) {
+  const storedIds = new Set()
+  const familyKeys = familyKeysById !== null && typeof familyKeysById?.get === 'function' ? familyKeysById : new Map()
+  const hiddenIdsByFamily = new Map()
+  for (const id of Array.isArray(settings?.hiddenModelIds) ? settings.hiddenModelIds : []) {
+    if (!validHiddenModelId(id) || storedIds.has(id)) continue
+    storedIds.add(id)
+    const family = familyKeys.get(id)
+    if (family === null || family === undefined) continue
+    const ids = hiddenIdsByFamily.get(family) ?? []
+    ids.push(id)
+    hiddenIdsByFamily.set(family, ids)
+  }
+  return { storedIds, familyKeysById: familyKeys, hiddenIdsByFamily }
+}
+
+/** Stored hidden ids belonging to this row, never the whole settings array. */
+export function hiddenIdsFor(entry, visibility) {
+  const id = typeof entry?.id === 'string' ? entry.id : ''
+  if (id === '' || !(visibility?.storedIds instanceof Set)) return []
+  const family = visibility.familyKeysById?.get(id)
+  if (family !== null && family !== undefined) {
+    return [...(visibility.hiddenIdsByFamily?.get(family) ?? [])]
+  }
+  return visibility.storedIds.has(id) ? [id] : []
+}
+
+/** Does one of the two group switches hide this row, independently of saved ids? */
+export function isModelHiddenByGroup(entry, settings) {
+  return (settings?.hideFreeModels === true && (!entry?.channel || entry.channel === 'anonymous' || entry.channel === 'kilo'
+      || (entry.channel === 'combo' && Array.isArray(entry.lanes) && entry.lanes.length > 0 && entry.lanes.every(lane => lane === 'free'))))
+    || (settings?.hideEacModels === true && entry?.channel === 'eac')
+}
+
+export function isModelHidden(entry, settings, visibility) {
+  return hiddenIdsFor(entry, visibility ?? buildModelVisibility(settings)).length > 0
+    || isModelHiddenByGroup(entry, settings)
 }
 
 export const STATS_INITIAL = {

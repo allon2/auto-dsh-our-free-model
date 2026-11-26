@@ -1,3 +1,14 @@
+/*!
+ * Vendored from 9router (https://github.com/decolua/9router, MIT,
+ * Copyright (c) 2024-2026 decolua and contributors), upstream file ".probe8.mjs".
+ *
+ * This is a byte-for-byte copy with the upstream base URL changed to the endpoint
+ * this plugin probes. It is kept as evidence for the findings in README.md, not as
+ * shipped code, and it imports 9router's own modules, so it does not run outside a
+ * 9router checkout.
+ *
+ * MIT licence text: LICENSE, section "9router".
+ */
 import { generateSessionId, generateRequestId } from "./open-sse/executors/opencode.js";
 import { applyFingerprintTools } from "./open-sse/utils/opencodeFingerprint.js";
 
@@ -53,7 +64,7 @@ async function measure(label, run, n = 3) {
 const chat = (model, extra) => async () => {
   const body = { model, messages: [{ role: "user", content: PROMPT }], stream: true, ...extra };
   applyFingerprintTools(body, false);
-  return post("/zen/v1/chat/completions", body);
+  return post("/inference/v1/chat/completions", body);
 };
 
 for (const model of ["ling-3.0-flash-fin-free", "space-bunny-free"]) {
@@ -68,10 +79,10 @@ for (const model of ["ling-3.0-flash-fin-free", "space-bunny-free"]) {
   await measure("reasoning.effort=low+budget", chat(model, { reasoning: { effort: "low", budget_tokens: 32 } }));
 }
 
-console.log(`\n===== anthropic /zen/v1/messages lane =====`);
+console.log(`\n===== anthropic /inference/v1/messages lane =====`);
 for (const model of ["ling-3.0-flash-fin-free", "space-bunny-free", "mimo-v2.6-flash-free"]) {
   await measure(`messages ${model}`, async () => {
     const body = { model, max_tokens: 2048, stream: true, messages: [{ role: "user", content: PROMPT }] };
-    return post("/zen/v1/messages", body, true);
+    return post("/inference/v1/messages", body, true);
   }, 1);
 }

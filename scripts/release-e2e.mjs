@@ -74,6 +74,10 @@ const server = http.createServer((req, res) => {
 })
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
 server.unref()
+// Same reason as legacy-upgrade-test: Node's default 5s keep-alive timeout
+// closes the sockets a finished download leaves pooled while the checks
+// between downloads run, and the next request dies as ECONNRESET.
+server.keepAliveTimeout = 600_000
 const base = `http://127.0.0.1:${server.address().port}`
 
 function updaterFor(pkgDir, dataDir) {
@@ -135,7 +139,8 @@ await check('a CRLF working tree describes the same release', () => {
   const copy = fs.mkdtempSync(path.join(os.tmpdir(), 'ofm-crlf-'))
   fs.cpSync(repo, path.join(copy, 'repo'), {
     recursive: true,
-    filter: source => !/[\\/](node_modules|\.git|\.verify)([\\/]|$)/.test(source),
+    // 排除构建缓存，避免把桌面 target、运行时和发布包带进换行测试。
+    filter: source => !/[\\/](node_modules|\.git|\.verify|target|dist|resources|\.node-license-cache)([\\/]|$)/.test(source),
   })
   const root = path.join(copy, 'repo')
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))

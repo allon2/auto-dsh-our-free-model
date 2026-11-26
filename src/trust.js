@@ -29,7 +29,12 @@ const LOOPBACK_NAMES = new Set(['127.0.0.1', '[::1]', '::1', 'localhost'])
  * quota to the whole subnet on the strength of a string in a settings file.
  */
 export function isLoopbackHost(value) {
-  const authority = authorityOf(String(value ?? ''), 'http')
+  const raw = String(value ?? '').trim()
+  // URL's authority parser requires brackets around an IPv6 literal, but the
+  // listener accepts the bare spelling too (`resolveLoopbackBind` strips the
+  // brackets itself, and the standalone URL formatter names `::1` directly).
+  if (raw === '::1') return true
+  const authority = authorityOf(raw, 'http')
   return authority !== null && LOOPBACK_NAMES.has(authority.hostname)
 }
 
@@ -77,9 +82,15 @@ export function connectionAdmissionView(service) {
  * @param {object|undefined} connection - the harness `connection` service, when the composition mounts one
  * @param {(decision: {status: number, source: string, reason: string}) => void} [onRejection]
  *   fixed diagnostic fields only; never request headers or error text
+ * @param {object} [peer] - Peer supplied by the Host after authorizing this HTTP route.
  * @returns {number|undefined}
  */
-export function rejectionFor(req, connection, onRejection) {
+export function rejectionFor(req, connection, onRejection, peer) {
+  // DSH 0.2.3 authorizes required routes before invoking their handlers.
+  if (peer !== undefined) {
+    if (peer?.principal?.kind === 'owner' && peer.signal?.aborted === false) return undefined
+    return 403
+  }
   let decision
   try {
     // Hosts before dsh 0.1.7 publish the same decision under the older name

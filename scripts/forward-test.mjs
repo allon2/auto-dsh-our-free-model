@@ -27,9 +27,12 @@ import net from 'node:net'
 import assert from 'node:assert/strict'
 import { startForwardServer, startLanRelay, resolveLoopbackBind, bindForwardPort, classifyBindError, startHeartbeat, SSE_HEARTBEAT_MS, rankLanAddresses } from '../src/forward.js'
 import { toToolDefs } from '../src/messages.js'
+import { CLIENT_TOOL_PREFIX, clientToolWireName } from '../src/o2a/tool-renames.js'
+import { V2_OFFICIAL_TOOL_ORDER } from '../src/o2a/official-tools.js'
 import { readStream } from '../src/stream.js'
 import { applyFingerprint } from '../src/upstream.js'
 import { fromOpenAiMessages } from '../index.js'
+import { publicModelRows } from '../src/core/completion.js'
 import { until } from './lib/fake-kernel.mjs'
 
 let failures = 0
@@ -115,6 +118,94 @@ function sseFrames(body) {
 const toolCallDeltas = body => sseFrames(body)
   .flatMap(frame => frame.choices?.[0]?.delta?.tool_calls ?? [])
 
+const toolArgumentsByIndex = body => {
+  const args = new Map()
+  for (const frame of toolCallDeltas(body)) {
+    args.set(frame.index, (args.get(frame.index) ?? '') + (frame.function?.arguments ?? ''))
+  }
+  return args
+}
+
+for (const endpoint of ['/v1/chat/completions', '/v1/responses', '/v1/messages']) {
+  await checkAsync(endpoint + ' preserves composite and virtual model identities (#323, #379)', async () => {
+    const seen = []
+    const base = await serve({
+      complete: async (request, onChunk) => {
+        seen.push(request)
+        onChunk?.({ type: 'text-delta', index: 0, text: 'local answer' })
+        onChunk?.({ type: 'finish', reason: { kind: 'stop' } })
+        return { text: 'local answer', toolCalls: [] }
+      },
+    })
+    for (const model of ['open_router/google/gemma-4-31b-it:free', 'combo:u-0123456789abcdef']) {
+      const response = await authFetch(base, endpoint, {
+        model, max_tokens: 64,
+        messages: [{ role: 'user', content: 'local audit' }],
+        ...(endpoint === '/v1/responses' ? { input: 'local audit' } : {}),
+      })
+      assert.equal(response.status, 200)
+      assert.equal((await response.json()).model, model)
+      assert.equal(seen.at(-1).model, model, 'the dispatcher receives the complete model identity')
+    }
+  })
+}
+
+for (const endpoint of ['/v1/chat/completions', '/v1/responses']) {
+  await checkAsync(endpoint + ' resolves flat, nested and model-suffix thinking effort (#74)', async () => {
+    const lane = makeLane()
+    const base = await serve(lane)
+    lane.script = () => ({ chunks: [], outcome: { text: 'done', toolCalls: [] } })
+    const model = 'mimo-v2.6-flash-free'
+    for (const stream of [false, true]) {
+      for (const [label, fields, expected] of [
+        ['nested', { reasoning: { effort: ' high ' } }, 'high'],
+        ['flat', { reasoning_effort: ' light ' }, 'light'],
+        ['suffix', { model: `${model} ( deep ) ` }, 'deep'],
+        ['flat priority', { model: `${model} (deep)`, reasoning_effort: ' light ', reasoning: { effort: 'high' } }, 'light'],
+        ['nested priority', { model: `${model} (deep)`, reasoning: { effort: ' balanced ' } }, 'balanced'],
+        ['empty flat', { reasoning_effort: ' \t ', reasoning: { effort: ' high ' } }, 'high'],
+        ['invalid flat', { reasoning_effort: 42, reasoning: { effort: ' low ' } }, 'low'],
+        ['empty fields', { model: `${model} ( balanced )`, reasoning_effort: '', reasoning: { effort: ' ' } }, 'balanced'],
+        ['absent', {}, undefined],
+      ]) {
+        const response = await authFetch(base, endpoint, {
+          model, stream, messages: [{ role: 'user', content: 'hi' }], input: 'hi', ...fields,
+        })
+        assert.equal(response.status, 200, `${label}, stream=${stream}`)
+        await response.text()
+        assert.equal(lane.seen.at(-1).model, model, 'the effort suffix is removed from the dispatched model')
+        assert.equal(lane.seen.at(-1).openAi.reasoning_effort, expected, `${label}, stream=${stream}`)
+      }
+    }
+  })
+}
+
+await checkAsync('the shared model roster advertises each supported effort menu and its default (#74)', async () => {
+  const snapshot = {
+    settings: { defaultMaxTokens: 4096, exposeRegionModels: false },
+    membership: { 'our-free-model': ['free-thinking', 'declared-thinking', 'plain'], 'our-free-model-region': ['regional'] },
+    catalog: [
+      { id: 'free-thinking', reasoning: true, maxOutput: 32768, contextWindow: 131072 },
+      { id: 'declared-thinking', channel: 'eac', reasoning: true, efforts: ['low', 'high'], effortDefault: 'high', maxOutput: 8192 },
+      { id: 'plain', reasoning: false, maxOutput: 8192 },
+      { id: 'regional', reasoning: true, maxOutput: 8192 },
+      { id: 'hidden', reasoning: true, maxOutput: 8192 },
+    ],
+  }
+  const base = await serve(makeLane(), { modelRows: () => publicModelRows(snapshot) })
+  const response = await fetch(`${base}/v1/models`, { headers: { authorization: 'Bearer k-test' } })
+  assert.equal(response.status, 200)
+  const { data } = await response.json()
+  assert.deepEqual(data.map(row => row.id), ['free-thinking', 'declared-thinking', 'plain'])
+  assert.deepEqual(data[0].x_ofm_efforts, ['light', 'balanced', 'deep'])
+  assert.equal(data[0].x_ofm_effort_default, 'balanced')
+  assert.equal(data[0].context_window, 131072)
+  assert.deepEqual(data[1].x_ofm_efforts, ['low', 'high'])
+  assert.equal(data[1].x_ofm_effort_default, 'high')
+  assert.equal(Object.hasOwn(data[2], 'x_ofm_efforts'), false)
+  assert.equal(Object.hasOwn(data[2], 'x_ofm_effort_default'), false)
+})
+
 // ── streaming tool-call wiring (#20) ─────────────────────────────────────────
 await checkAsync('streaming tool_calls renumber from 0 after reasoning blocks', async () => {
   const lane = makeLane()
@@ -145,19 +236,392 @@ await checkAsync('streaming tool_calls renumber from 0 after reasoning blocks', 
   assert.equal(args, '{"file":"x"}')
 })
 
+await checkAsync('every streamed tool-call frame carries a function delta (#452)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  // Arguments arriving one fragment per frame is the shape that used to leak a
+  // bare `{"index":0}` ahead of every increment: the opening frame was the only
+  // one with a `function`, and the rest carried nothing but the index.
+  lane.script = () => ({
+    chunks: [
+      { type: 'tool-call-delta', index: 0, id: 'call_t', name: 'mytool', argumentsDelta: '{"x":' },
+      { type: 'tool-call-delta', index: 0, argumentsDelta: '1' },
+      { type: 'tool-call-delta', index: 0, argumentsDelta: '}' },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_t', name: 'mytool', arguments: '{"x":1}' }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'mytool', parameters: { type: 'object', properties: {} } } }],
+  })
+  assert.equal(response.status, 200)
+  const frames = toolCallDeltas(await response.text())
+  // A strict client validates `delta.tool_calls[0].function` as an object on
+  // every frame, so one bare index frame aborts the whole stream.
+  assert.deepEqual(frames.filter(frame => frame.function === undefined).map(frame => frame.index), [],
+    `every frame must carry a function delta, got ${JSON.stringify(frames)}`)
+  const opening = frames[0]
+  assert.equal(opening.id, 'call_t')
+  assert.equal(opening.type, 'function', 'the opening frame carries the official chunk type')
+  assert.equal(opening.function.name, 'mytool')
+  assert.equal(opening.function.arguments, '')
+  assert.equal(frames.filter(frame => frame.id !== undefined).length, 1, 'id rides the opening frame only')
+  assert.equal(frames.map(frame => frame.function.arguments).join(''), '{"x":1}')
+})
+
+await checkAsync('a channel that only closes a tool block still emits its call (#829)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  // The `minimax/*` shape measured in #829: text, then a block-end carrying the
+  // whole call, and not a single `tool-call-delta` in between. The stream used
+  // to announce `finish_reason: tool_calls` with zero tool frames, so the client
+  // had nothing to run and the turn ended after the preamble.
+  lane.script = () => ({
+    chunks: [
+      { type: 'text-delta', index: 0, text: 'I will list the files.' },
+      { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'call_be', name: 'list_files', arguments: '{"path":"."}' } },
+      { type: 'usage', usage: { inputTokens: 5, outputTokens: 6, totalTokens: 11 } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: 'I will list the files.', toolCalls: [{ slot: 1, id: 'call_be', name: 'list_files', arguments: '{"path":"."}' }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'list_files', parameters: { type: 'object', properties: {} } } }],
+  })
+  assert.equal(response.status, 200)
+  const body = await response.text()
+  const frames = toolCallDeltas(body)
+  assert.ok(frames.length > 0, `a closed tool block must produce frames, got ${JSON.stringify(body)}`)
+  const opening = frames.find(frame => frame.function?.name !== undefined)
+  assert.equal(opening?.function?.name, 'list_files')
+  assert.equal(opening?.id, 'call_be')
+  const args = frames.filter(frame => frame.function?.arguments !== undefined).map(frame => frame.function.arguments).join('')
+  assert.equal(args, '{"path":"."}')
+  assert.ok(body.includes('"finish_reason":"tool_calls"'), 'the finish reason still reports the call')
+})
+
+await checkAsync('a block-end after its own deltas never doubles the arguments (#829)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  lane.script = () => ({
+    chunks: [
+      { type: 'tool-call-delta', index: 0, id: 'call_a', name: 'read', argumentsDelta: '{"file"' },
+      { type: 'tool-call-delta', index: 0, argumentsDelta: ':"x"}' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_a', name: 'read', arguments: '{"file":"x"}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_a', name: 'read', arguments: '{"file":"x"}' }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'read', parameters: { type: 'object', properties: {} } } }],
+  })
+  const frames = toolCallDeltas(await response.text())
+  assert.equal(frames.map(frame => frame.function?.arguments ?? '').join(''), '{"file":"x"}',
+    'the block-end must not append the arguments its deltas already sent')
+  assert.equal(frames.filter(frame => frame.id !== undefined).length, 1, 'identity rides one frame only')
+})
+
+await checkAsync('held arguments are emitted once when a block-end supplies the name (#829 boundary)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  // Arguments can arrive before the adapter has restored the call's name. They
+  // are held to keep decoys off the wire, but the block-end must still turn the
+  // completed call into runnable frames once its name confirms the target.
+  lane.script = () => ({
+    chunks: [
+      { type: 'tool-call-delta', index: 0, id: 'call_x', argumentsDelta: '{"path":' },
+      { type: 'tool-call-delta', index: 0, argumentsDelta: '"."}' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_x', name: 'list_files', arguments: '{"path":"."}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_x', name: 'list_files', arguments: '{"path":"."}' }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'list_files', parameters: { type: 'object', properties: {} } } }],
+  })
+  assert.equal(response.status, 200)
+  const body = await response.text()
+  const frames = toolCallDeltas(body)
+  assert.ok(frames.length > 0, `held arguments must be emitted after the name arrives, got ${JSON.stringify(body)}`)
+  assert.ok(frames.every(frame => frame.function && typeof frame.function === 'object'),
+    `every tool frame must carry a function delta, got ${JSON.stringify(frames)}`)
+  const opening = frames.find(frame => frame.id !== undefined)
+  assert.equal(opening?.id, 'call_x')
+  assert.equal(opening?.function?.name, 'list_files')
+  assert.equal(frames.filter(frame => frame.id !== undefined).length, 1, 'identity rides one frame only')
+  assert.equal(frames.map(frame => frame.function.arguments ?? '').join(''), '{"path":"."}',
+    'the held fragments must be emitted exactly once')
+  const finish = sseFrames(body).map(frame => frame.choices?.[0]?.finish_reason).filter(Boolean)
+  assert.deepEqual(finish, ['tool_calls'], `got ${finish}`)
+})
+
+await checkAsync('a held prefix is completed from the final block arguments (#920)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  const finalArgs = '{"quote":"雪"}'
+  lane.script = () => ({
+    chunks: [
+      { type: 'tool-call-delta', index: 0, id: 'call_q', argumentsDelta: '{"quote":' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_q', name: 'list_files', arguments: finalArgs } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_q', name: 'list_files', arguments: finalArgs }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'list_files', parameters: { type: 'object', properties: {} } } }],
+  })
+  const body = await response.text()
+  const frames = toolCallDeltas(body)
+  assert.equal(frames.find(frame => frame.id !== undefined)?.function?.name, 'list_files')
+  assert.equal(frames.map(frame => frame.function.arguments ?? '').join(''), finalArgs,
+    'unsent held fragments must not replace the complete arguments on block-end')
+  const finish = sseFrames(body).map(frame => frame.choices?.[0]?.finish_reason).filter(Boolean)
+  assert.deepEqual(finish, ['tool_calls'], `got ${finish}`)
+})
+
+await checkAsync('a forwarded prefix appends only the final block suffix (#920)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  const prefix = '{"quote":'
+  const finalArgs = '{"quote":"雪"}'
+  lane.script = () => ({
+    chunks: [
+      { type: 'tool-call-delta', index: 0, id: 'call_q', name: 'list_files', argumentsDelta: prefix },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_q', name: 'list_files', arguments: finalArgs } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_q', name: 'list_files', arguments: finalArgs }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'list_files', parameters: { type: 'object', properties: {} } } }],
+  })
+  const body = await response.text()
+  const frames = toolCallDeltas(body)
+  assert.equal(frames.map(frame => frame.function.arguments ?? '').join(''), finalArgs,
+    'the block-end must append only bytes the client has not received')
+  const finish = sseFrames(body).map(frame => frame.choices?.[0]?.finish_reason).filter(Boolean)
+  assert.deepEqual(finish, ['tool_calls'], `got ${finish}`)
+})
+
+await checkAsync('mismatched forwarded arguments finish as length (#920)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  const forwarded = '{"quote":"a"}'
+  const finalArgs = '{"quote":"雪"}'
+  lane.script = () => ({
+    chunks: [
+      { type: 'tool-call-delta', index: 0, id: 'call_q', name: 'list_files', argumentsDelta: forwarded },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_q', name: 'list_files', arguments: finalArgs } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_q', name: 'list_files', arguments: finalArgs }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'list_files', parameters: { type: 'object', properties: {} } } }],
+  })
+  const body = await response.text()
+  const frames = toolCallDeltas(body)
+  assert.equal(frames.map(frame => frame.function.arguments ?? '').join(''), forwarded,
+    'bytes already sent cannot be replaced by a mismatched final block')
+  const finish = sseFrames(body).map(frame => frame.choices?.[0]?.finish_reason).filter(Boolean)
+  assert.deepEqual(finish, ['length'], `a corrupt tool call must not finish as tool_calls, got ${finish}`)
+  assert.deepEqual(sseFrames(body).map(frame => frame.error?.message).filter(Boolean), [], 'a mismatch is a truncation, not an error frame')
+})
+
+await checkAsync('a cut first tool cannot be hidden by a complete parallel tool (#920)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  const alpha = '{"n":1}'
+  const cutAlpha = alpha + '{"second":'
+  const beta = '{"m":"雪"}'
+  lane.script = () => ({
+    chunks: [
+      { type: 'tool-call-delta', index: 7, id: 'r_alpha', name: 'alpha', argumentsDelta: alpha },
+      { type: 'block-end', index: 2, block: { type: 'tool-call', id: 'r_beta', name: 'beta', arguments: beta } },
+      { type: 'block-end', index: 7, block: { type: 'tool-call', id: 'r_alpha', name: 'alpha', arguments: cutAlpha } },
+      { type: 'finish', reason: { kind: 'max-tokens' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 2, id: 'r_beta', name: 'beta', arguments: beta }], truncated: true },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: ['alpha', 'beta'].map(name => ({ type: 'function', function: { name, parameters: { type: 'object', properties: {} } } })),
+  })
+  const body = await response.text()
+  const args = toolArgumentsByIndex(body)
+  assert.equal(args.get(0), cutAlpha)
+  assert.equal(args.get(1), beta)
+  const finish = sseFrames(body).map(frame => frame.choices?.[0]?.finish_reason).filter(Boolean)
+  assert.deepEqual(finish, ['length'], `a cut A must not be hidden by complete B, got ${finish}`)
+})
+
+await checkAsync('a cut second tool cannot be hidden by a complete parallel tool (#920)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  const alpha = '{"n":1}'
+  const cutBeta = '{"m":'
+  lane.script = () => ({
+    chunks: [
+      { type: 'block-end', index: 7, block: { type: 'tool-call', id: 'r_alpha', name: 'alpha', arguments: alpha } },
+      { type: 'block-end', index: 2, block: { type: 'tool-call', id: 'r_beta', name: 'beta', arguments: cutBeta } },
+      { type: 'finish', reason: { kind: 'max-tokens' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 7, id: 'r_alpha', name: 'alpha', arguments: alpha }], truncated: true },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: ['alpha', 'beta'].map(name => ({ type: 'function', function: { name, parameters: { type: 'object', properties: {} } } })),
+  })
+  const body = await response.text()
+  const args = toolArgumentsByIndex(body)
+  assert.equal(args.get(0), alpha)
+  assert.equal(args.get(1), cutBeta)
+  const finish = sseFrames(body).map(frame => frame.choices?.[0]?.finish_reason).filter(Boolean)
+  assert.deepEqual(finish, ['length'], `a cut B must not be hidden by complete A, got ${finish}`)
+})
+
+await checkAsync('two cut parallel tools finish as length (#920)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  const cutAlpha = '{"n":1}{"second":'
+  const cutBeta = '{"m":'
+  lane.script = () => ({
+    chunks: [
+      { type: 'block-end', index: 2, block: { type: 'tool-call', id: 'r_beta', name: 'beta', arguments: cutBeta } },
+      { type: 'block-end', index: 7, block: { type: 'tool-call', id: 'r_alpha', name: 'alpha', arguments: cutAlpha } },
+      { type: 'finish', reason: { kind: 'max-tokens' } },
+    ],
+    outcome: { text: '', toolCalls: [], truncated: true },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: ['alpha', 'beta'].map(name => ({ type: 'function', function: { name, parameters: { type: 'object', properties: {} } } })),
+  })
+  const body = await response.text()
+  const args = toolArgumentsByIndex(body)
+  assert.equal(args.get(0), cutBeta)
+  assert.equal(args.get(1), cutAlpha)
+  const finish = sseFrames(body).map(frame => frame.choices?.[0]?.finish_reason).filter(Boolean)
+  assert.deepEqual(finish, ['length'], `two cut tools must finish as length, got ${finish}`)
+})
+
+await checkAsync('two complete parallel tools keep tool_calls (#920)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  const alpha = '{"n":1}'
+  const beta = '{"m":"雪"}'
+  lane.script = () => ({
+    chunks: [
+      { type: 'block-end', index: 2, block: { type: 'tool-call', id: 'r_beta', name: 'beta', arguments: beta } },
+      { type: 'block-end', index: 7, block: { type: 'tool-call', id: 'r_alpha', name: 'alpha', arguments: alpha } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [
+      { slot: 2, id: 'r_beta', name: 'beta', arguments: beta },
+      { slot: 7, id: 'r_alpha', name: 'alpha', arguments: alpha },
+    ], truncated: false },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: ['alpha', 'beta'].map(name => ({ type: 'function', function: { name, parameters: { type: 'object', properties: {} } } })),
+  })
+  const body = await response.text()
+  const args = toolArgumentsByIndex(body)
+  assert.equal(args.get(0), beta)
+  assert.equal(args.get(1), alpha)
+  const finish = sseFrames(body).map(frame => frame.choices?.[0]?.finish_reason).filter(Boolean)
+  assert.deepEqual(finish, ['tool_calls'], `complete parallel tools must keep tool_calls, got ${finish}`)
+})
+
+await checkAsync('a repeated block-end emits its arguments once (#829 boundary)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  const block = { type: 'tool-call', id: 'call_be', name: 'list_files', arguments: '{"value":"alpha"}' }
+  lane.script = () => ({
+    chunks: [
+      { type: 'block-end', index: 0, block },
+      { type: 'block-end', index: 0, block },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_be', name: 'list_files', arguments: block.arguments }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'list_files', parameters: { type: 'object', properties: {} } } }],
+  })
+  const frames = toolCallDeltas(await response.text())
+  assert.equal(frames.map(frame => frame.function?.arguments ?? '').join(''), block.arguments,
+    'a repeated block-end must not append the same argument bytes twice')
+  assert.equal(frames.filter(frame => frame.id !== undefined).length, 1, 'identity rides one frame only')
+})
+
+await checkAsync('held arguments before two block-ends are emitted once (#829 boundary)', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  const block = { type: 'tool-call', id: 'call_x', name: 'list_files', arguments: '{"value":"alpha"}' }
+  lane.script = () => ({
+    chunks: [
+      { type: 'tool-call-delta', index: 0, id: 'call_x', argumentsDelta: '{"value":' },
+      { type: 'tool-call-delta', index: 0, argumentsDelta: '"alpha"}' },
+      { type: 'block-end', index: 0, block },
+      { type: 'block-end', index: 0, block },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_x', name: 'list_files', arguments: block.arguments }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'list_files', parameters: { type: 'object', properties: {} } } }],
+  })
+  const frames = toolCallDeltas(await response.text())
+  assert.equal(frames.map(frame => frame.function?.arguments ?? '').join(''), block.arguments,
+    'held arguments must not be replayed by a repeated block-end')
+  assert.equal(frames.filter(frame => frame.id !== undefined).length, 1, 'identity rides one frame only')
+})
+
+await checkAsync('held arguments for a decoy stay hidden when its block-end names the decoy', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  lane.script = () => ({
+    chunks: [
+      { type: 'text-delta', index: 1, text: 'let me check' },
+      { type: 'tool-call-delta', index: 0, id: 'call_d', argumentsDelta: '{"command":' },
+      { type: 'tool-call-delta', index: 0, argumentsDelta: '"ls"}' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_d', name: 'shell', arguments: '{"command":"ls"}' } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: 'let me check', toolCalls: [{ slot: 0, id: 'call_d', name: 'shell', arguments: '{"command":"ls"}' }] },
+  })
+  const response = await authFetch(base, '/v1/chat/completions', {
+    model: 'mimo-v2.6-flash-free', stream: true,
+    tools: [{ type: 'function', function: { name: 'mytool', parameters: { type: 'object', properties: {} } } }],
+  })
+  const body = await response.text()
+  assert.deepEqual(toolCallDeltas(body), [], 'held fragments must not leak before a decoy is rejected')
+  const finish = sseFrames(body).map(frame => frame.choices?.[0]?.finish_reason).filter(Boolean)
+  assert.deepEqual(finish, ['stop'], `got ${finish}`)
+})
+
 await checkAsync('a decoy tool call never reaches the streaming client', async () => {
   const lane = makeLane()
   const base = await serve(lane)
   lane.script = () => ({
     chunks: [
       { type: 'text-delta', index: 1, text: 'let me check' },
-      // The model dialed the fingerprint decoy: the caller declared no such tool.
-      { type: 'tool-call-delta', index: 2, id: 'call_d', name: 'bash', argumentsDelta: '{"command"' },
+      // The model dialed the fingerprint placeholder: the caller declared no such tool.
+      { type: 'tool-call-delta', index: 2, id: 'call_d', name: 'shell', argumentsDelta: '{"command"' },
       { type: 'tool-call-delta', index: 2, argumentsDelta: ':"ls"}' },
-      { type: 'block-end', index: 2, block: { type: 'tool-call', id: 'call_d', name: 'bash', arguments: '{"command":"ls"}' } },
+      { type: 'block-end', index: 2, block: { type: 'tool-call', id: 'call_d', name: 'shell', arguments: '{"command":"ls"}' } },
       { type: 'finish', reason: { kind: 'tool-calls' } },
     ],
-    outcome: { text: 'let me check', toolCalls: [{ slot: 2, id: 'call_d', name: 'bash', arguments: '{"command":"ls"}' }] },
+    outcome: { text: 'let me check', toolCalls: [{ slot: 2, id: 'call_d', name: 'shell', arguments: '{"command":"ls"}' }] },
   })
   const response = await authFetch(base, '/v1/chat/completions', {
     model: 'mimo-v2.6-flash-free', stream: true,
@@ -170,8 +634,10 @@ await checkAsync('a decoy tool call never reaches the streaming client', async (
 })
 
 // Measured live: the token saver compacts a diff, appends the filter's own
-// `[full diff: … --no-compact]` hint, the model obeys it by calling `bash`, and a
-// caller that declared no tools has that call suppressed. Suppressing it is right;
+// `[full diff: … --no-compact]` hint, the model obeys it by calling a shell tool,
+// and a caller that declared no such tool has that call suppressed (the v2 gate
+// makes the plugin declare `read`/`shell` placeholders, so a dial at one of those
+// names is the case). Suppressing it is right;
 // reporting the turn as a clean empty success is not — `finish_reason: stop` with
 // `content: null` is indistinguishable from "the model said nothing", and it sent
 // a live verification run hunting for a bug in the model instead of in the
@@ -179,13 +645,13 @@ await checkAsync('a decoy tool call never reaches the streaming client', async (
 await checkAsync('a turn whose only output was a suppressed call is reported, not answered empty', async () => {
   // A guarded lane, not `makeLane`: the non-streaming path calls `complete`
   // without an `onChunk`, and the shared helper forwards chunks unconditionally.
-  const outcome = { text: '', toolCalls: [{ slot: 0, id: 'call_s', name: 'bash', arguments: '{"command":"git diff --no-compact"}' }] }
+  const outcome = { text: '', toolCalls: [{ slot: 0, id: 'call_s', name: 'shell', arguments: '{"command":"git diff --no-compact"}' }] }
   const lane = {
     complete: async (request, onChunk) => {
       if (typeof onChunk === 'function') {
         for (const chunk of [
-          { type: 'tool-call-delta', index: 0, id: 'call_s', name: 'bash', argumentsDelta: '{"command":"git diff --no-compact"}' },
-          { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_s', name: 'bash', arguments: '{"command":"git diff --no-compact"}' } },
+          { type: 'tool-call-delta', index: 0, id: 'call_s', name: 'shell', argumentsDelta: '{"command":"git diff --no-compact"}' },
+          { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_s', name: 'shell', arguments: '{"command":"git diff --no-compact"}' } },
           { type: 'finish', reason: { kind: 'tool-calls' } },
         ]) onChunk(chunk)
       }
@@ -197,14 +663,14 @@ await checkAsync('a turn whose only output was a suppressed call is reported, no
   const body = await streamed.text()
   assert.deepEqual(toolCallDeltas(body), [], 'the undeclared call still must not reach the client')
   const error = sseFrames(body).map(frame => frame.error?.message).find(Boolean)
-  assert.ok(typeof error === 'string' && error.includes('bash'), `the stream must name the call it suppressed, got ${JSON.stringify(error)}`)
+  assert.ok(typeof error === 'string' && error.includes('shell'), `the stream must name the call it suppressed, got ${JSON.stringify(error)}`)
   const finish = sseFrames(body).map(frame => frame.choices?.[0]?.finish_reason).filter(Boolean)
   assert.deepEqual(finish, [], 'a turn reported as failed carries no clean finish frame')
 
   const plain = await authFetch(base, '/v1/chat/completions', { model: 'mimo-v2.6-flash-free' })
   assert.equal(plain.status, 502, 'the non-streaming surface reports it as a failure too')
   const payload = JSON.parse(await plain.text())
-  assert.ok(String(payload.error?.message ?? '').includes('bash'), `got ${JSON.stringify(payload)}`)
+  assert.ok(String(payload.error?.message ?? '').includes('shell'), `got ${JSON.stringify(payload)}`)
 })
 
 // The counter-case, so the note cannot swallow a legitimate truncation: a cut
@@ -254,7 +720,7 @@ await checkAsync('non-streaming drops decoys and unexecutable calls after a cut'
     outcome: {
       text: '',
       toolCalls: [
-        { slot: 0, id: 'call_d', name: 'bash', arguments: '{}' },
+        { slot: 0, id: 'call_d', name: 'shell', arguments: '{}' },
         { slot: 1, id: 'call_b', name: 'mytool', arguments: '{"x":' },
         { slot: 2, id: 'call_g', name: 'mytool', arguments: '{"y":1}' },
       ],
@@ -277,6 +743,47 @@ await checkAsync('a non-JSON body answers 400', async () => {
   assert.equal(response.status, 400)
   const payload = await response.json()
   assert.equal(payload.error.type, 'invalid_request_error')
+})
+
+await checkAsync('a JSON null body answers 400 instead of a TypeError 500', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  for (const path of ['/v1/chat/completions', '/v1/responses', '/v1/messages']) {
+    const response = await authFetch(base, path, 'null')
+    assert.equal(response.status, 400, path)
+    const payload = await response.json()
+    assert.equal(payload.error.type, 'invalid_request_error', path)
+    if (path === '/v1/messages') assert.equal(payload.type, 'error')
+    assert.match(payload.error.message, /JSON object/, path)
+  }
+  assert.equal(lane.seen.length, 0, 'a malformed body must not reach the lane')
+})
+
+await checkAsync('a dispatch failure before content preserves its HTTP error for streaming callers', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  lane.script = () => { throw Object.assign(new Error('model "m" not found'), { statusCode: 404 }) }
+  for (const [path, body] of [
+    ['/v1/chat/completions', { model: 'm', stream: true, messages: [{ role: 'user', content: 'hi' }] }],
+    ['/v1/responses', { model: 'm', stream: true, input: 'hi' }],
+  ]) {
+    const response = await authFetch(base, path, body)
+    assert.equal(response.status, 404)
+    const payload = await response.json()
+    assert.match(payload.error.message, /not found/)
+  }
+})
+
+await checkAsync('the Anthropic endpoint renders dispatch failures in its own error envelope', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  lane.script = () => { throw Object.assign(new Error('model "m" not found'), { statusCode: 404 }) }
+  const response = await authFetch(base, '/v1/messages', { model: 'm', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] })
+  assert.equal(response.status, 404)
+  const payload = await response.json()
+  assert.equal(payload.type, 'error')
+  assert.equal(typeof payload.error?.type, 'string')
+  assert.match(payload.error.message, /not found/)
 })
 
 // ── the address a peer on this network should dial ───────────────────────────
@@ -354,7 +861,23 @@ await checkAsync('responses endpoint streams events and reports usage', async ()
   assert.equal(response.status, 200)
   const body = await response.text()
   const types = body.split('\n').filter(line => line.startsWith('event: ')).map(line => line.slice('event: '.length))
-  assert.deepEqual(types, ['response.created', 'response.output_item.added', 'response.output_text.delta', 'response.output_text.delta', 'response.completed'])
+  assert.deepEqual(types, ['response.created', 'response.output_item.added', 'response.content_part.added',
+    'response.output_text.delta', 'response.output_text.delta', 'response.output_text.done',
+    'response.content_part.done', 'response.output_item.done', 'response.completed'])
+  const frames = body.split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)))
+  // #548: a strict accumulator rejects the stream on the first event when
+  // `sequence_number` is missing, so every frame has to carry one, starting at
+  // 0 and strictly increasing.
+  assert.equal(frames.length, types.length, 'every event must come with a data frame')
+  assert.deepEqual(frames.map(frame => frame.sequence_number), frames.map((_, position) => position),
+    'sequence_number must start at 0 and increase by one per event')
+  assert.equal(frames.every(frame => Number.isInteger(frame.sequence_number)), true)
+  const added = frames.find(frame => frame.type === 'response.output_item.added')
+  const done = frames.find(frame => frame.type === 'response.output_item.done')
+  assert.equal(added.item.id, done.item.id, 'native Codex requires a stable output item ID')
+  assert.equal(done.item.status, 'completed')
+  assert.equal(done.item.content[0].text, 'hello world', 'the completed item is what native Codex renders')
+  assert.equal(frames.find(frame => frame.type === 'response.output_text.delta').content_index, 0)
   const completed = JSON.parse(body.split('\n').filter(line => line.startsWith('data: ')).at(-1).slice('data: '.length))
   assert.equal(completed.response.status, 'completed')
   assert.equal(completed.response.output[0].content[0].text, 'hello world')
@@ -383,6 +906,8 @@ await checkAsync('responses streaming gives text and calls distinct output index
   assert.equal(response.status, 200)
   const body = await response.text()
   const frames = body.split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)))
+  assert.deepEqual(frames.map(frame => frame.sequence_number), frames.map((_, position) => position),
+    'the counter must run across mixed text and tool-call frames too')
   const added = frames.filter(frame => frame.type === 'response.output_item.added')
   assert.deepEqual(added.map(frame => frame.output_index), [0, 1, 2], `indexes must be distinct and sequential, got ${added.map(frame => frame.output_index)}`)
   assert.deepEqual(added.map(frame => frame.item.type), ['message', 'function_call', 'function_call'])
@@ -394,6 +919,73 @@ await checkAsync('responses streaming gives text and calls distinct output index
   assert.deepEqual(completed.response.output.map(row => row.type), ['message', 'function_call', 'function_call'])
   assert.equal(completed.response.output[1].arguments, '{"a":1}')
   assert.equal(completed.response.output[2].arguments, '{"b":2}')
+  const finished = frames.filter(frame => frame.type === 'response.output_item.done')
+  assert.deepEqual(finished.map(frame => frame.output_index), [0, 1, 2])
+  for (const item of finished) {
+    const start = added.find(frame => frame.output_index === item.output_index)
+    assert.equal(start.item.id, item.item.id)
+    if (item.item.type === 'function_call') assert.equal(start.item.call_id, item.item.call_id)
+  }
+})
+
+await checkAsync('responses streams reasoning as a summary item and keeps item ids unique across turns', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  lane.script = () => ({
+    chunks: [
+      { type: 'reasoning-delta', index: 0, text: 'checking the request' },
+      { type: 'text-delta', index: 1, text: 'answer' },
+      { type: 'tool-call-delta', index: 2, id: 'call_a', name: 'mytool', argumentsDelta: '{}' },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: 'answer', toolCalls: [{ slot: 2, id: 'call_a', name: 'mytool', arguments: '{}' }] },
+  })
+  const first = await authFetch(base, '/v1/responses', { model: 'muse-spark-1.3-contributor-free', input: 'one', stream: true })
+  const firstBody = await first.text()
+  const second = await authFetch(base, '/v1/responses', { model: 'muse-spark-1.3-contributor-free', input: 'two', stream: true })
+  const secondBody = await second.text()
+  for (const body of [firstBody, secondBody]) {
+    assert.ok(body.includes('event: response.reasoning_summary_part.added'))
+    assert.ok(body.includes('event: response.reasoning_summary_text.delta'))
+    assert.ok(body.includes('event: response.reasoning_summary_text.done'))
+    const frames = body.split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)))
+    const reasoningAdded = frames.find(frame => frame.type === 'response.output_item.added' && frame.item.type === 'reasoning')
+    const reasoningDone = frames.find(frame => frame.type === 'response.output_item.done' && frame.item.type === 'reasoning')
+    assert.equal(reasoningAdded.item.id, reasoningDone.item.id)
+    assert.deepEqual(reasoningDone.item.summary, [{ type: 'summary_text', text: 'checking the request' }])
+    assert.ok(frames.some(frame => frame.type === 'response.output_text.delta' && frame.delta === 'answer'))
+    assert.ok(frames.some(frame => frame.type === 'response.function_call_arguments.delta'))
+    const completed = frames.find(frame => frame.type === 'response.completed')
+    assert.deepEqual(completed.response.output.map(item => item.type), ['reasoning', 'message', 'function_call'])
+    assert.equal(completed.response.output[1].phase, 'commentary')
+  }
+  const itemIds = body => body.split('\n').filter(line => line.startsWith('data: ')).flatMap(line => {
+    const frame = JSON.parse(line.slice(6))
+    if (frame.type === 'response.output_item.added') return [frame.item.id]
+    if (frame.type === 'response.output_item.done') return [frame.item.id]
+    if (frame.type === 'response.created') return [frame.response.id]
+    return []
+  })
+  const firstIds = new Set(itemIds(firstBody))
+  assert.ok(itemIds(secondBody).every(item => !firstIds.has(item)), 'a new response must not reuse output item ids')
+})
+
+await checkAsync('responses JSON carries reasoning and marks the terminal message final', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  lane.script = () => ({
+    chunks: [],
+    outcome: {
+      text: 'final answer', reasoning: 'short thought', toolCalls: [],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    },
+  })
+  const response = await authFetch(base, '/v1/responses', { model: 'muse-spark-1.3-contributor-free', input: 'hi' })
+  const payload = await response.json()
+  assert.deepEqual(payload.output.map(item => item.type), ['reasoning', 'message'])
+  assert.deepEqual(payload.output[0].summary, [{ type: 'summary_text', text: 'short thought' }])
+  assert.equal(payload.output[1].phase, 'final_answer')
+  assert.equal(payload.output[1].content[0].text, 'final answer')
 })
 
 await checkAsync('responses endpoint reports an incomplete turn after a cut', async () => {
@@ -406,12 +998,73 @@ await checkAsync('responses endpoint reports an incomplete turn after a cut', as
   assert.deepEqual(payload.incomplete_details, { reason: 'max_output_tokens' })
 })
 
+await checkAsync('responses endpoint restores namespace tools on streaming and JSON output', async () => {
+  const lane = makeLane()
+  const base = await serve(lane)
+  const longNs = 'very_long_namespace_identifier_that_exceeds_limit'
+  const longTool = 'very_long_subagent_tool_name_exceeds_limit'
+  const { flatNamespaceToolName } = await import('../src/messages.js')
+  const longFlat = flatNamespaceToolName(longNs, longTool)
+  assert.ok(longFlat.length <= 64)
+
+  const tools = [
+    {
+      type: 'namespace',
+      name: 'multi_agent_v1',
+      tools: [{ type: 'function', name: 'spawn_agent', parameters: { type: 'object', properties: {} } }],
+    },
+    {
+      type: 'namespace',
+      name: longNs,
+      tools: [{ type: 'function', name: longTool, parameters: { type: 'object', properties: {} } }],
+    },
+  ]
+
+  lane.script = () => ({
+    chunks: [
+      { type: 'tool-call-delta', index: 0, id: 'call_ns_1', name: 'multi_agent_v1__spawn_agent', argumentsDelta: '{"message":"hi"}' },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_ns_1', name: 'multi_agent_v1__spawn_agent', arguments: '{"message":"hi"}' }] },
+  })
+  const streamRes = await authFetch(base, '/v1/responses', {
+    model: 'muse-spark-1.3-contributor-free', input: 'hi', stream: true, tools,
+  })
+  assert.equal(streamRes.status, 200)
+  const frames = (await streamRes.text()).split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)))
+  const added = frames.find(frame => frame.type === 'response.output_item.added')
+  const argsDone = frames.find(frame => frame.type === 'response.function_call_arguments.done')
+  const itemDone = frames.find(frame => frame.type === 'response.output_item.done')
+  const completed = frames.find(frame => frame.type === 'response.completed')
+  assert.equal(added.item.name, 'spawn_agent')
+  assert.equal(added.item.namespace, 'multi_agent_v1')
+  assert.equal(argsDone.name, 'spawn_agent')
+  assert.equal(argsDone.namespace, 'multi_agent_v1')
+  assert.equal(itemDone.item.name, 'spawn_agent')
+  assert.equal(itemDone.item.namespace, 'multi_agent_v1')
+  assert.equal(completed.response.output[0].name, 'spawn_agent')
+  assert.equal(completed.response.output[0].namespace, 'multi_agent_v1')
+
+  lane.script = () => ({
+    chunks: [],
+    outcome: { text: '', toolCalls: [{ slot: 0, id: 'call_ns_2', name: longFlat, arguments: '{}' }] },
+  })
+  const jsonRes = await authFetch(base, '/v1/responses', {
+    model: 'muse-spark-1.3-contributor-free', input: 'hi', tools,
+  })
+  assert.equal(jsonRes.status, 200)
+  const payload = await jsonRes.json()
+  assert.equal(payload.output[0].name, longTool)
+  assert.equal(payload.output[0].namespace, longNs)
+})
+
 // ── caller tools survive the round trip (#26) ────────────────────────────────
 // The listener used to pre-convert its caller's `body.tools` into the OpenAI
 // wrapper shape before handing them to the adapter, while the adapter's own
 // conversion reads `tool.name` — so every tool was dropped, the request reached
-// the wire with an empty tool list, and `applyFingerprint` filled the quartet's
-// self-disabling decoys in their place and pinned `tool_choice: 'none'`. The
+// the wire with an empty tool list, and `applyFingerprint` filled the gate's
+// placeholders in their place (v1 also pinned `tool_choice: 'none'`; v2 refuses
+// that value outright). The
 // model then told the client it had no tools, and any decoy it called anyway was
 // dropped downstream as an empty answer.
 const openAiTool = name => ({
@@ -455,26 +1108,51 @@ check('the adapter conversion keeps every caller tool', () => {
   assert.equal(declared.length, callerTools.length)
 })
 
-check('a non-empty caller list keeps its real tools and no forced tool_choice', () => {
+check('a caller list renames every foreign tool; the official set completes', () => {
   const body = { tools: toToolDefs([normalizeTool(openAiTool('pwsh')), normalizeTool(openAiTool('glob'))], 'chat') }
   applyFingerprint(body, false)
-  assert.deepEqual(body.tools.map(tool => tool.function.name), ['bash', 'glob', 'grep', 'read'])
+  // An official name is reserved for the official definition. `glob` folds onto
+  // the official spelling but carries the caller's own prose, so it takes an
+  // opaque handle like `pwsh` — a caller schema at an official name is answered
+  // 429 (measured 2026-11-22); the official set, `glob` included, is appended
+  // afterwards and declared exactly once.
+  const names = body.tools.map(tool => tool.function.name)
+  const clientWires = names.filter(name => name.startsWith(CLIENT_TOOL_PREFIX))
+  assert.deepEqual(clientWires, [clientToolWireName('pwsh'), clientToolWireName('glob')])
+  const renamedGlob = body.tools.find(tool => tool.function.name === clientToolWireName('glob'))
+  assert.ok(renamedGlob, 'the caller glob rides an opaque handle')
+  // The caller's words survive under the handle; only ASCII spaces become NBSP,
+  // which stops a literal phrase in a caller description matching an upstream rule.
+  assert.equal(renamedGlob.function.description, 'glob\u00a0tool')
+  const officials = names.filter(name => !name.startsWith(CLIENT_TOOL_PREFIX))
+  assert.deepEqual(officials, [...V2_OFFICIAL_TOOL_ORDER])
+  assert.equal(officials.filter(name => name === 'glob').length, 1)
   assert.equal(String(body.tools[0].function.description).includes('unavailable'), false)
-  assert.equal(String(body.tools[1].function.description).includes('unavailable'), false)
   assert.equal(body.tool_choice, undefined)
 })
 
-check('an empty caller list is the shape that forces tool_choice none', () => {
+check('an empty caller list still gets the official set, and no tool_choice', () => {
   const body = { tools: [] }
   applyFingerprint(body, false)
-  assert.deepEqual(body.tools.map(tool => tool.function.name), ['bash', 'glob', 'grep', 'read'])
-  assert.equal(body.tool_choice, 'none')
+  assert.deepEqual(body.tools.map(tool => tool.function.name), [...V2_OFFICIAL_TOOL_ORDER])
+  // v1 forced `tool_choice: 'none'` here; v2 answers that value with 403.
+  assert.equal(body.tool_choice, undefined)
 })
 
-await checkAsync('a promoted quartet slot stays mapped back to the caller name', async () => {
-  const body = { tools: toToolDefs([normalizeTool(openAiTool('pwsh'))], 'chat') }
+await checkAsync('a caller spelling of a gate name takes a handle and maps back', async () => {
+  const body = { tools: toToolDefs([normalizeTool(openAiTool('read'))], 'chat') }
   const map = applyFingerprint(body, false)
-  assert.equal(map.get('bash'), 'pwsh')
+  const wire = clientToolWireName('read')
+  // The official name carries the official schema; the caller's own bytes live
+  // on the handle. Mapping "read" itself would be wrong — that name no longer
+  // refers to the caller's tool on the wire.
+  assert.equal(body.tools.filter(tool => tool.function.name === 'read').length, 1)
+  assert.deepEqual(body.tools.find(tool => tool.function.name === 'read').function.parameters.required, ['path'])
+  const handle = body.tools.find(tool => tool.function.name === wire)
+  assert.ok(handle, 'the caller read rides an opaque handle')
+  assert.equal(handle.function.description, 'read\u00a0tool')
+  assert.equal(map.get(wire), 'read')
+  assert.equal(map.get('read'), undefined)
 })
 
 await checkAsync('the lane receives the caller tools the client sent', async () => {
@@ -597,6 +1275,29 @@ await checkAsync('a nameless tool call downgrades its turn to max-tokens (#92)',
   assert.equal(named.state.brokenToolCall, false)
 })
 
+// Issue #474: a structurally complete argument that merely fails to parse (a
+// bare value with all brackets closed) is not a cut — the call must reach the
+// host so the schema violation comes back as a fixable error. Flagging it
+// masqueraded as max-tokens and killed every recovery path. An unclosed string
+// is still a cut.
+await checkAsync('complete-but-invalid arguments stay executable; an unclosed string stays broken (#474)', async () => {
+  const invalid = await readChat([
+    chatFrame({ tool_calls: [{ index: 0, id: 'call_inv', function: { name: 'glob', arguments: '{"pattern": **/*billion-context*/package.json, "path": "D:/", "limit": 50}' } }] }),
+  ])
+  assert.equal(invalid.state.brokenToolCall, false, 'a complete-but-invalid argument must not flag the turn')
+  const cut = await readChat([
+    chatFrame({ tool_calls: [{ index: 0, id: 'call_cut', function: { name: 'glob', arguments: '{"pattern": "un' } }] }),
+  ])
+  assert.equal(cut.state.brokenToolCall, true, 'an unclosed string is still a cut')
+  // A lost-prefix fragment (`"some/path.txt"}` — both quotes present, the
+  // opening `{` lost) has a negative depth — still a cut, it stays on the
+  // retry path.
+  const lostPrefix = await readChat([
+    chatFrame({ tool_calls: [{ index: 0, id: 'call_lp', function: { name: 'read', arguments: '"some/path.txt"}' } }] }),
+  ])
+  assert.equal(lostPrefix.state.brokenToolCall, true, 'a lost-prefix fragment is still a cut')
+})
+
 const fakeResponse = () => {
   const res = {
     writes: [],
@@ -613,7 +1314,12 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 await checkAsync('a silent stream is kept alive with SSE comment frames', async () => {
   const res = fakeResponse()
   const stop = startHeartbeat(res, 5)
-  await sleep(60)
+  // Wait for the frames rather than for a fixed slice of wall time: a 5 ms
+  // interval against a 60 ms sleep assumes the timer never gets starved, and on
+  // a loaded box it does — the assertion then reports one frame and the suite
+  // flakes. Polling keeps the requirement (repeated frames) without timing it.
+  const deadline = Date.now() + 2000
+  while (res.writes.length < 2 && Date.now() < deadline) await sleep(5)
   assert.ok(res.writes.length >= 2, `expected repeated comment frames, got ${res.writes.length}`)
   assert.ok(res.writes.every(chunk => chunk === ': ping\n\n'), 'only comment frames may go out')
   stop()
@@ -727,8 +1433,13 @@ await checkAsync('bindForwardPort walks past a port that stays taken', async () 
   assert.notEqual(bound.port, held.port)
   assert.ok(bound.port > 0)
   if (heldNext !== null) assert.notEqual(bound.port, heldNext.port, 'a taken neighbour must be skipped too')
-  assert.equal(bound.bindError?.code, 'EADDRINUSE', `expected the occupant's code, got ${bound.bindError?.code}`)
-  await new Promise(resolve => server.close(() => resolve()))
+  try {
+    const occupiedCodes = process.platform === 'win32' ? ['EADDRINUSE', 'EACCES'] : ['EADDRINUSE']
+    assert.ok(occupiedCodes.includes(bound.bindError?.code), `expected the occupant's code, got ${bound.bindError?.code}`)
+    assert.equal(classifyBindError({ code: bound.bindError.code }).retryable, true)
+  } finally {
+    await new Promise(resolve => server.close(() => resolve()))
+  }
 })
 
 await checkAsync('startForwardServer reports the port it settled on and still serves', async () => {

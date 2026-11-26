@@ -1,3 +1,14 @@
+/*!
+ * Vendored from 9router (https://github.com/decolua/9router, MIT,
+ * Copyright (c) 2024-2026 decolua and contributors), upstream file ".probe9.mjs".
+ *
+ * This is a byte-for-byte copy with the upstream base URL changed to the endpoint
+ * this plugin probes. It is kept as evidence for the findings in README.md, not as
+ * shipped code, and it imports 9router's own modules, so it does not run outside a
+ * 9router checkout.
+ *
+ * MIT licence text: LICENSE, section "9router".
+ */
 import { generateSessionId, generateRequestId } from "./open-sse/executors/opencode.js";
 import { applyFingerprintTools } from "./open-sse/utils/opencodeFingerprint.js";
 import { appendFileSync, writeFileSync } from "fs";
@@ -41,7 +52,7 @@ async function post(path, body, anthropic) {
 const chat = (model, extra) => async () => {
   const body = { model, messages: [{ role: "user", content: PROMPT }], stream: true, ...extra };
   applyFingerprintTools(body, false);
-  return post("/zen/v1/chat/completions", body);
+  return post("/inference/v1/chat/completions", body);
 };
 
 async function measure(label, run, n = 3) {
@@ -69,7 +80,7 @@ const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwA
 async function vision(label, model, content) {
   const body = { model, max_tokens: 120, stream: true, messages: [{ role: "user", content }] };
   applyFingerprintTools(body, false);
-  const r = await post("/zen/v1/chat/completions", body);
+  const r = await post("/inference/v1/chat/completions", body);
   log(`  ${label.padEnd(30)} ${r.status} ${r.status === 200 ? "accepted" : r.txt.slice(0, 120).replace(/\s+/g, " ")}`);
 }
 log("===== vision input =====");

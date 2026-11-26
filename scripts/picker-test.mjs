@@ -1,7 +1,7 @@
 /**
  * What the model picker is allowed to advertise.
  *
- * Issue #3: a model the gateway names in `/zen/v1/models` but refuses to route
+ * Issue #3: a model the gateway names in `/inference/v1/models` but refuses to route
  * at all still appeared in the picker, so picking it spent a turn on a
  * guaranteed failure. The probe already knew — the settings page said 暂不可用 —
  * but `computeMembership` only ever separated the region-gated ones and left
@@ -16,7 +16,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { EventEmitter } from 'node:events'
+import { EventEmitter, getEventListeners } from 'node:events'
 import { chatFrames, callRoute, FakeRequest, fakeContext, freePort, stubUpstream, until } from './lib/fake-kernel.mjs'
 
 let failures = 0
@@ -85,17 +85,24 @@ if (adapter === undefined) {
 const api = () => routes.find(route => route.kind === 'prefix')?.handler
 await until(() => api() !== undefined, { what: 'the settings API route' })
 
+// Automatic probing is disabled by owner policy. This suite is about picker
+// reads, so it waits for the listing, then drives the one probe round it needs
+// through the manual endpoint.
+await callRoute(api(), 'POST', '/api/our-free-model/refresh')
+check('startup and a listing refresh spend no probe requests', stub.requests.length, 0)
+await callRoute(api(), 'POST', '/api/our-free-model/reprobe')
+check('a bare reprobe spends exactly one request - the roster head, never a round', stub.requests.length, 1)
+
 const ids = models => models.map(model => model.id)
 const advertised = async route => ids(await adapter.listModels(route))
 
-// Every probe in the round has to have landed before the verdicts mean anything.
-await until(() => {
-  const store = JSON.parse(fs.readFileSync(path.join(scratch, 'our-free-model', 'availability.json'), 'utf8'))
-  return Object.keys(store.results ?? {}).length >= LISTING.length && store.at > 0
-}, { what: 'a full probe round' }).catch(error => {
-  console.log(`FAIL ${error.message}\nlogs: ${ctx.__logs.join(' | ')}\nrequests seen by the stub: ${stub.requests.length}`)
-  process.exit(1)
-})
+// 2.8.1 semantics: a reprobe is one model, one request. The verdicts the checks
+// below read are driven the way a user drives them - one named model at a time
+// through the same manual endpoint.
+const probe = async id => callRoute(api(), 'POST', '/api/our-free-model/reprobe', { model: id })
+for (const id of LISTING.slice(1)) await probe(id)
+const probeStore = () => JSON.parse(fs.readFileSync(path.join(scratch, 'our-free-model', 'availability.json'), 'utf8'))
+check('every named probe left its verdict', Object.keys(probeStore().results ?? {}).length, LISTING.length)
 
 check('a refused model leaves the picker', (await advertised(ROUTE_MAIN)).includes('deepseek-v4-flash-free'), false)
 check('and so does one the listing names but no route answers for', (await advertised(ROUTE_MAIN)).includes('jev-1.13-free'), false)
@@ -145,6 +152,8 @@ check('the settings page says it has not been probed', midRoundRow?.availability
 check('rather than a verdict it does not have', midRoundRow?.detail ?? '', '')
 gate.resolve()
 await round
+// Discovery refreshed the listing only; probe the new row explicitly.
+await probe('union-alpha')
 check('once the round lands it carries a verdict',
   (await callRoute(api(), 'GET', '/api/our-free-model/summary')).json.catalog
     .find(row => row.id === 'union-alpha')?.availability, 'available')
@@ -200,13 +209,39 @@ await callRoute(api(), 'POST', '/api/our-free-model/settings', { exposeRegionMod
 
 // The round where the lane itself is down: every model reads as refused.
 stub.api.refuseAll = true
-await callRoute(api(), 'POST', '/api/our-free-model/reprobe')
+for (const id of LISTING) await probe(id)
 check('a lane-wide failure never empties the picker', (await advertised(ROUTE_MAIN)).length > 0, true)
 check('it keeps the refused models rather than dropping them', (await advertised(ROUTE_MAIN)).includes('deepseek-v4-flash-free'), true)
-check('and says so in the log', ctx.__logs.some(line => line.includes('refused all')), true)
+check('and the refusals are on record for the user to read', probeStore().results['deepseek-v4-flash-free']?.state, 'unavailable')
+const visibleId = 'space-bunny-free'
+const beforeVisibilityEvents = ctx.__captured.events.filter(event => event === 'emit:llm/adapters-updated').length
+const hiddenSave = await callRoute(api(), 'POST', '/api/our-free-model/settings', {
+  hiddenModelIds: [visibleId, visibleId, 'unrelated-hidden-probe'], hideEacModels: true,
+})
+check('picker visibility settings save successfully', hiddenSave.status, 200)
+check('hidden ids are canonical and persisted', JSON.parse(fs.readFileSync(path.join(scratch, 'our-free-model', 'settings.json'), 'utf8')).hiddenModelIds, [visibleId, 'unrelated-hidden-probe'])
+check('refusedAll never restores an explicitly hidden model', (await advertised(ROUTE_MAIN)).includes(visibleId), false)
+check('visibility changes broadcast topology invalidation',
+  ctx.__captured.events.filter(event => event === 'emit:llm/adapters-updated').length > beforeVisibilityEvents, true)
+const hiddenSummary = (await callRoute(api(), 'GET', '/api/our-free-model/summary')).json
+check('management keeps hidden rows with a recovery marker', hiddenSummary.catalog.find(row => row.id === visibleId)?.hiddenByUser, true)
+check('a hidden row carries only the stored ids in its model family',
+  hiddenSummary.catalog.find(row => row.id === visibleId)?.hiddenIds, [visibleId])
+check('and never receives the whole settings blacklist',
+  hiddenSummary.catalog.find(row => row.id === visibleId)?.hiddenIds.includes('unrelated-hidden-probe'), false)
+check('an unhidden row carries an empty family list',
+  hiddenSummary.catalog.find(row => row.id === 'mimo-v2.6-flash-free')?.hiddenIds, [])
+check('a hidden id still resolves for history', (await adapter.resolveModel(ROUTE_MAIN, visibleId)).id, visibleId)
+for (const patch of [null, [], { hiddenModelIds: [null] }, { hiddenModelIds: [''] }, { hideEacModels: 1 }, { hideFreeModels: 'true' }, { enabled: false, hiddenModelIds: [3] }]) {
+  check('invalid visibility patch is refused atomically', (await callRoute(api(), 'POST', '/api/our-free-model/settings', patch)).status, 400)
+}
+check('invalid patch does not change existing settings', (await callRoute(api(), 'GET', '/api/our-free-model/summary')).json.settings.enabled, true)
+await callRoute(api(), 'POST', '/api/our-free-model/settings', { hideFreeModels: true })
+check('whole free group remains hidden during lane-wide refusal', await advertised(ROUTE_MAIN), [])
+await callRoute(api(), 'POST', '/api/our-free-model/settings', { hiddenModelIds: [], hideFreeModels: false, hideEacModels: false })
 
 stub.api.refuseAll = false
-await callRoute(api(), 'POST', '/api/our-free-model/reprobe')
+for (const id of LISTING) await probe(id)
 check('the next honest round hides them again', (await advertised(ROUTE_MAIN)).includes('deepseek-v4-flash-free'), false)
 
 // ── the settings boundary ────────────────────────────────────────────────────
@@ -283,18 +318,36 @@ check('the settings route accepts the desktop relay before connection appears',
   (await callRoute(api(), 'GET', '/api/our-free-model/summary', undefined, desktopHeaders)).status, 200)
 const events = routes.find(route => route.kind === 'exact' && route.path === '/api/our-free-model/events')?.handler
 if (events === undefined) throw new Error('events route was not registered')
-const eventReq = Object.assign(new EventEmitter(), new FakeRequest('GET', '/api/our-free-model/events', undefined, desktopHeaders))
-let eventStatus = 0
-let eventBody = ''
-const eventRes = Object.assign(new EventEmitter(), {
-  writeHead(status) { eventStatus = status },
-  write(text) { eventBody += text },
-  end() {},
-})
-events(eventReq, eventRes)
-check('the events route accepts the desktop relay', eventStatus, 200)
-check('and sends the initial snapshot', eventBody.includes('event: hello'), true)
-eventRes.emit('close')
+function openEvents(peer) {
+  const req = Object.assign(new EventEmitter(), new FakeRequest('GET', '/api/our-free-model/events', undefined, desktopHeaders))
+  const res = Object.assign(new EventEmitter(), {
+    status: 0,
+    body: '',
+    writableEnded: false,
+    writeHead(status) { this.status = status },
+    write(text) { this.body += text },
+    end() { this.writableEnded = true },
+  })
+  events(req, res, peer)
+  return res
+}
+const desktopEvents = openEvents()
+check('the events route accepts the desktop relay', desktopEvents.status, 200)
+check('and sends the initial snapshot', desktopEvents.body.includes('event: hello'), true)
+desktopEvents.emit('close')
+
+const peerController = new AbortController()
+const peer = { principal: { kind: 'owner' }, signal: peerController.signal }
+const ownerEvents = openEvents(peer)
+check('a Host-admitted owner receives an open event stream', [ownerEvents.status, ownerEvents.writableEnded], [200, false])
+peerController.abort()
+check('ending the owner Peer closes its event stream', ownerEvents.writableEnded, true)
+
+const disconnectController = new AbortController()
+const disconnectedEvents = openEvents({ ...peer, signal: disconnectController.signal })
+check('an event stream listens to its owner Peer', getEventListeners(disconnectController.signal, 'abort').length, 1)
+disconnectedEvents.emit('close')
+check('a disconnected event stream releases the Peer listener', getEventListeners(disconnectController.signal, 'abort').length, 0)
 
 ctx.__services.connection.admit = () => ({ rejection: 401 })
 ctx.__mountService('connection')
@@ -331,7 +384,7 @@ ctx.__services.connection.admit = () => undefined
 // catalogs were pinging the same lane at once, on a lane whose 429 carries a
 // growing `retry-after`, and the quota being spent belongs to the user.
 const probesOf = id => stub.requests.filter(row => row.body?.model === id).length
-holdProbe = { model: 'space-bunny-free', ...Promise.withResolvers() }
+holdProbe = { model: 'mimo-v2.6-flash-free', ...Promise.withResolvers() }
 const before = probesOf('mimo-v2.6-flash-free')
 const first = callRoute(api(), 'POST', '/api/our-free-model/reprobe')
 await until(() => probesOf('mimo-v2.6-flash-free') > before, { what: 'the first round to be in flight' })

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import {
   DEFAULT_IMAGE_LIMITS,
@@ -9,7 +9,6 @@ import {
   type ImageLimits,
 } from './images.js'
 import { isThinkingOffEffort, translateReasoningEffort } from '../reasoning-ladder.js'
-import { rewriteTencentContentFingerprints } from './tencent-fingerprint.js'
 
 export class OpenAiGatewayError extends Error {
   constructor(
@@ -34,6 +33,10 @@ export interface OpenAiChatMessage {
   content?: unknown
   tool_calls?: unknown
   tool_call_id?: unknown
+  /** DeepSeek / Qoder 思考回传。思考模式的工具轮次缺了它，上游会 400。 */
+  reasoning_content?: unknown
+  /** Cline 等客户端用的另一个思考字段名。 */
+  reasoning?: unknown
 }
 
 /**
@@ -66,10 +69,6 @@ export interface OpenAiChatRequest {
 
 export function normalizeMaxTokens(value: number | undefined, provider: string, model: string): number | undefined {
   if (value === undefined) return undefined
-  // GLM-5.2 与 DeepSeek V4 实测均会拒绝 128000，65536 可正常推理。
-  if (provider === 'codearts' && (/^deepseek-v4-(flash|pro)$/.test(model) || model === 'GLM-5.2')) {
-    return Math.min(value, 65536)
-  }
   return value
 }
 /**
@@ -104,9 +103,6 @@ export function normalizeMaxTokens(value: number | undefined, provider: string, 
  * ⚠️ 但**完全不认识的值仍然 400**（例如拼错的 `banana`）：那不是「名字不通用」，
  * 是调用方写错了。静默翻译会让拼写错误变成「档位悄悄不生效」。
  *
- * ⚠️ **CodeArts 例外**：该 provider 只有开/关两态（适配器把档位阶梯拍平了，
- * 见 `llm-adapter.ts`），任何档位名都等价，故一律二值化、永不报错。
- *
  * ## 返回值是**三态**，不可混用
  *
  * - `string`：归一化后的档位，下发它；
@@ -128,9 +124,6 @@ export function normalizeReasoningEffort(
 ): string | null | undefined {
   if (requested === undefined) return undefined
   const value = String(requested)
-  if (provider === 'codearts' && model !== undefined) {
-    return isThinkingOffEffort(value) ? 'off' : 'on'
-  }
   const record = modelInfo as { reasoning?: { efforts?: readonly { id?: unknown }[] } } | undefined
   const declared = (record?.reasoning?.efforts ?? [])
     .map((effort) => String((effort as { id?: unknown } | undefined)?.id))
@@ -254,6 +247,11 @@ export function textFromContent(content: unknown): string {
   }).join('')
 }
 
+/** Produce a fresh V4 source identity for each gateway-owned message (PR #229). */
+export function gatewaySource(): Message['source'] {
+  return { kind: 'plugin:dsh-openai-gateway' } as Message['source']
+}
+
 /**
  * 造一条 DSH 消息。
  *
@@ -266,6 +264,38 @@ export function createGatewayMessage(
   source: Message['source'],
 ): Message {
   return { id: randomUUID() as Message['id'], role, content, source }
+}
+
+/**
+ * 委托当前宿主构造工具结果：≤0.1.6 使用 user/tool-result 包裹块，
+ * 0.1.7+ 使用一等 tool 消息。外部 provider 没有 channel-pack 的兼容层，
+ * 固定其中任何一种形状都会让另一代宿主丢失工具应答或拒绝请求。
+ * 工厂在两代内核中均存在，同时负责 id、source 与不可变内容。
+ */
+export function createGatewayToolMessage(
+  toolCallId: string,
+  content: Message['content'],
+  isError?: boolean,
+): Message {
+  return createToolResultMessage({
+    callId: toolCallId as never,
+    content,
+    isError: isError === true,
+  })
+}
+
+/**
+ * Chat 入站的思考文本。优先 `reasoning_content`，否则认 `reasoning`。
+ * 不 trim：`" "` 是 DeepSeek V4 接受的占位，trim 掉就又变成没回传。
+ */
+function inboundReasoning(value: OpenAiChatMessage): string | undefined {
+  const raw = typeof value.reasoning_content === 'string'
+    ? value.reasoning_content
+    : typeof value.reasoning === 'string'
+      ? value.reasoning
+      : undefined
+  if (raw === undefined || raw.length === 0) return undefined
+  return raw
 }
 
 function convertToolCalls(raw: unknown): Message['content'] {
@@ -300,15 +330,10 @@ async function convertMessage(
   const value = raw as OpenAiChatMessage
   const role = value.role
   if (role === 'system') {
-    // ⚠️ 腾讯系（`buddy` / `workbuddy`）后端有**内容级**风控：客户端自带的
-    // 模板句（如 ZCode 的 gitStatus 注入）会让整轮请求 400 + 11128。
-    // 改写只作用于 system、且只改腾讯系 —— 依据见 ./tencent-fingerprint.ts。
     return createGatewayMessage('system', [{
       type: 'text',
-      text: rewriteTencentContentFingerprints(textFromContent(value.content), provider),
-    }], {
-      kind: 'plugin', plugin: 'dsh-openai-gateway',
-    })
+      text: textFromContent(value.content),
+    }], gatewaySource())
   }
   if (role === 'user') {
     // ⚠️ user 消息走 parts：图片在这里被真正接收（其它角色不接受图片）。
@@ -316,7 +341,14 @@ async function convertMessage(
   }
   if (role === 'assistant') {
     const text = textFromContent(value.content)
-    const content: Message['content'] = text.length > 0 ? [{ type: 'text', text }] : []
+    const content: Message['content'] = []
+    // 思考模式（DeepSeek V4 等）要求：带 tool_calls 的历史助手消息必须把
+    // 当时的 reasoning_content 原样带回。丢掉它，下一跳就是
+    // 「The reasoning_content in the thinking mode must be passed back」。
+    // 空串不算（上游把空串也当成没回传）；单个空格是客户端用来占位的合法值，保留。
+    const reasoning = inboundReasoning(value)
+    if (reasoning !== undefined) content.push({ type: 'reasoning', text: reasoning })
+    if (text.length > 0) content.push({ type: 'text', text })
     if (value.tool_calls !== undefined) content.push(...convertToolCalls(value.tool_calls))
     return createGatewayMessage('assistant', content, { kind: 'model', provider, model })
   }
@@ -331,11 +363,12 @@ async function convertMessage(
     // 图片走与 user 消息**同一份**入站实现（附件服务落盘），故这里复用
     // `partsFromContent`；各适配器本就递归消费 `tool-result` 的内嵌图片
     // （见 `trae-adapter.ts` 的 `collectImages` / `userContentParts`）。
-    return createGatewayMessage('user', [{
-      type: 'tool-result',
-      toolCallId: value.tool_call_id as never,
-      content: await partsFromContent(value.content, bridge, limits),
-    }], { kind: 'tool', callId: value.tool_call_id as never })
+    //
+    // 形状由当前宿主决定，外部 provider 必须收到与该内核匹配的工具消息。
+    return createGatewayToolMessage(
+      value.tool_call_id,
+      await partsFromContent(value.content, bridge, limits),
+    )
   }
   throw new OpenAiGatewayError(`unsupported message role: ${String(role)}`)
 }

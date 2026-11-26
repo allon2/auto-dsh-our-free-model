@@ -12,8 +12,8 @@
  *    listings retain the last roster, including an already-cleared roster.
  * 2. **Mount** — the channel's entries join the catalog under `channel:
  *    'kilo'`, land on the main route without ever being probed (a probe would
- *    spend itself against the wrong gateway), and the free lane's health gauge
- *    stays free-lane only.
+ *    spend itself against the wrong gateway), and the shared free-pool UI reports
+ *    listed Kilo models as untested candidates, not verified successes.
  * 3. **Turn** — a streamed answer survives this gateway's wire dialect: the
  *    `: KILO PROCESSING` keep-alive comment lines, reasoning under
  *    `delta.reasoning`, indexed tool-call deltas, the usage frame, `[DONE]` —
@@ -87,6 +87,7 @@ const KILO_MODELS = [
   { id: 'kilo-auto/free', name: 'Auto Free', isFree: true, context_length: 256000, top_provider: { max_completion_tokens: 32768 }, architecture: { input_modalities: ['text'] }, supported_parameters: ['max_tokens', 'reasoning'] },
   { id: 'anthropic/claude-sonnet-5', name: 'Anthropic: Claude Sonnet 5', isFree: false },
 ]
+let kiloTurnError
 let kiloListing = { status: 200, payload: { data: KILO_MODELS } }
 const turns = []
 const kiloServer = http.createServer((req, res) => {
@@ -100,6 +101,10 @@ const kiloServer = http.createServer((req, res) => {
       return
     }
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+    if (kiloTurnError !== undefined) {
+      res.writeHead(kiloTurnError.status, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(kiloTurnError.payload)); return
+    }
     turns.push(body)
     if (String(body.model).startsWith('anthropic/')) {
       res.writeHead(401, { 'content-type': 'application/json' })
@@ -163,8 +168,8 @@ const kiloRows = (summaryJson.catalog ?? []).filter(entry => entry.channel === '
 check('the Kilo roster joins the catalog from the live listing', kiloRows.map(entry => entry.id),
   ['nvidia/nemotron-3.5-lightning:free', 'kilo-auto/free'])
 check('a paid id is never advertised keyless', kiloRows.some(entry => entry.id === 'anthropic/claude-sonnet-5'), false)
-check('roster presence is the availability verdict for a never-probed lane',
-  kiloRows.every(entry => entry.availability === 'available'), true)
+check('roster presence is listed, not a successful inference verdict',
+  kiloRows.every(entry => entry.availabilitySource === 'listing' && entry.availability === 'unknown'), true)
 check('the entries sit on the main route', kiloRows.every(entry => entry.route === ROUTE_MAIN), true)
 check('a verified-off family declares the full thinking menu, EAC shape',
   kiloRows.find(entry => entry.id === 'nvidia/nemotron-3.5-lightning:free')?.efforts, ['disabled', 'low', 'medium', 'high'])
@@ -242,6 +247,23 @@ try {
 check('a paid id keyless fails as a plain request defect', paidFailure?.code, 'CLIENT_ERROR')
 check('with the message naming the lane, not a credential store',
   /not on the free pool/.test(paidFailure?.message ?? ''), true)
+
+// Error details go through the real HTTP poster and preserve status classification.
+for (const [raw, provider, detail] of [
+  ['temporarily rate-limited upstream', 'fixture', 'temporarily rate-limited upstream (fixture)'],
+  [JSON.stringify({ error: { message: 'no upstreams available' } }), 'fixture', 'no upstreams available (fixture)'],
+  [JSON.stringify({ message: 'provider overloaded' }), undefined, 'provider overloaded'],
+  ['', undefined, ''],
+  [{ unexpected: true }, undefined, ''],
+]) {
+  kiloTurnError = { status: 503, payload: { error: { message: 'Provider returned error', metadata: { raw, provider_name: provider } } } }
+  let failure
+  try { await postKiloStreamed({ body: { model: 'kilo-auto/free' }, onData() {} }) }
+  catch (error) { failure = error }
+  check('Kilo raw detail ' + JSON.stringify(raw), failure?.message, 'Provider returned error' + (detail ? ': ' + detail : ''))
+  check('Kilo raw metadata preserves the upstream status', failure?.status, 503)
+}
+kiloTurnError = undefined
 
 // Drive actual catalog refreshes; an HTTP success with no free models is an
 // authoritative roster, while a failed listing is not an empty-pool signal.

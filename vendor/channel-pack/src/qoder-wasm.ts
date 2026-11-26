@@ -340,6 +340,12 @@ interface Glue {
   readString: (ptr: number, len: number) => string
   /** 写字符串进 wasm 内存，返回指针（长度经 `lastLength` 传出）。 */
   writeString: (text: string) => number
+  /**
+   * 分配若干输入串、执行调用。**不释放**这些缓冲区 —— Rust 侧按所有权接管
+   * 入参，JS 再 free 会双重释放（见实现处的注释与 #895）。
+   * 回调收到的指针与长度按入参顺序排列。
+   */
+  withStrings: <T>(texts: string[], invoke: (pointers: number[], lengths: number[]) => T) => T
   lastLength: () => number
   /** 对象堆：JS 对象 ↔ 整数索引。 */
   heapObject: (index: number) => unknown
@@ -417,7 +423,33 @@ async function createGlue(): Promise<Glue> {
     lastLength = encoded.length
     return ptr
   }
-
+  /**
+   * Allocate, run, and hand every input buffer to the wasm export.
+   *
+   * ⚠️ **Do not free these buffers from JS.** The Qoder exports take their
+   * `&str` parameters **by ownership** (wasm-bindgen passes `String`, and the
+   * Rust side drops it before returning), so the wasm already released them.
+   * Freeing again here is a double free: the Rust allocator panics and the
+   * whole instantiation traps with `RuntimeError: unreachable`, which surfaces
+   * at the plugin boundary as a bare `unreachable` error with no code — the
+   * request never leaves the machine (issue #895).
+   *
+   * Evidence (measured with the shipped `qoder-auth-wasm.wasm`, no account
+   * needed): calling an export and then freeing the same pointer panics every
+   * time, while handing 100 × 200 KiB inputs to an export leaves the heap flat
+   * — the wasm does reclaim them. The real per-request growth issue #826 saw
+   * came from `QoderContext` / `RequestResult` (see `dispose` and
+   * `prepareInfer`), not from input buffers.
+   */
+  const withStrings = <T>(texts: string[], invoke: (pointers: number[], lengths: number[]) => T): T => {
+    const pointers: number[] = []
+    const lengths: number[] = []
+    for (const text of texts) {
+      pointers.push(writeString(text))
+      lengths.push(lastLength)
+    }
+    return invoke(pointers, lengths)
+  }
   const callString = (invoke: (stack: number) => void): string => {
     let ptr = 0
     let len = 0
@@ -533,6 +565,7 @@ async function createGlue(): Promise<Glue> {
     view,
     readString,
     writeString,
+    withStrings,
     lastLength: () => lastLength,
     heapObject,
     pushObject,
@@ -556,10 +589,9 @@ export async function generateRuntimeAuthFields(user: QoderWasmUserInfo): Promis
     organization_tags: user.organizationTags ?? [],
     data_policy_agreed: user.dataPolicyAgreed ?? false,
   })
-  const raw = g.callString((stack) => {
-    const a = g.writeString(payload)
-    g.exports.generate_runtime_auth_fields!(stack, a, g.lastLength())
-  })
+  const raw = g.withStrings([payload], ([a], [aLen]) => g.callString((stack) => {
+    g.exports.generate_runtime_auth_fields!(stack, a, aLen)
+  }))
   return JSON.parse(raw) as QoderRuntimeAuthFields
 }
 
@@ -580,13 +612,9 @@ export async function generateRuntimeAuthFields(user: QoderWasmUserInfo): Promis
  */
 export async function decryptModelCatalog(encrypted: string, machineId: string): Promise<unknown> {
   const g = await getGlue()
-  const raw = g.callString((stack) => {
-    const a = g.writeString(encrypted)
-    const aLen = g.lastLength()
-    const b = g.writeString(machineId)
-    const bLen = g.lastLength()
+  const raw = g.withStrings([encrypted, machineId], ([a, b], [aLen, bLen]) => g.callString((stack) => {
     g.exports.model_cache_decrypt!(stack, a, aLen, b, bLen)
-  })
+  }))
   return JSON.parse(raw)
 }
 
@@ -604,6 +632,9 @@ export class QoderEncryptedInfer {
     /** 加密端点所在 host（`agent_chat_generation`）。 */
     private readonly host: string,
   ) {}
+
+  /** `dispose()` 是否已释放 context —— 防止重复释放（wasm 侧不保证幂等）。 */
+  private disposed = false
 
   /** 创建客户端（会调 WASM 构造 `QoderContext`）。 */
   static async create(options: {
@@ -634,14 +665,13 @@ export class QoderEncryptedInfer {
       data_policy_agreed: options.user.dataPolicyAgreed ?? false,
     })
 
-    const context = g.callPointer((stack) => {
-      const machine = g.writeString(options.machineId); const machineLen = g.lastLength()
-      const ver = g.writeString(version); const verLen = g.lastLength()
-      const info = g.writeString(userInfoJson); const infoLen = g.lastLength()
-      const meta = g.writeString(JSON.stringify(options.metadata)); const metaLen = g.lastLength()
-      // 参数顺序：(sp, machineId, len, version, len, userInfo, len, clientMeta, len)
-      g.exports.qodercontext_new!(stack, machine, machineLen, ver, verLen, info, infoLen, meta, metaLen)
-    })
+    const context = g.withStrings(
+      [options.machineId, version, userInfoJson, JSON.stringify(options.metadata)],
+      ([machine, ver, info, meta], [machineLen, verLen, infoLen, metaLen]) => g.callPointer((stack) => {
+        // 参数顺序：(sp, machineId, len, version, len, userInfo, len, clientMeta, len)
+        g.exports.qodercontext_new!(stack, machine, machineLen, ver, verLen, info, infoLen, meta, metaLen)
+      }),
+    )
 
     return new QoderEncryptedInfer(g, context, options.metadata, options.host)
   }
@@ -657,43 +687,71 @@ export class QoderEncryptedInfer {
     const g = this.g
     const payload = buildQoderInferPayload(ask)
 
-    const result = g.callPointer((stack) => {
-      const host = g.writeString(this.host); const hostLen = g.lastLength()
-      const body = g.writeString(JSON.stringify(payload)); const bodyLen = g.lastLength()
-      const key = g.writeString(ask.modelKey); const keyLen = g.lastLength()
-      const source = g.writeString(ask.source ?? 'system'); const sourceLen = g.lastLength()
-      g.exports.qodercontext_prepareInferRequest!(
-        stack, this.context, host, hostLen, body, bodyLen, key, keyLen, source, sourceLen,
-      )
-    })
-
-    const headerMap = g.takeObject(g.exports.requestresult_headers!(result))
-    const headers: Record<string, string> = {}
-    if (headerMap instanceof Map) {
-      for (const [k, v] of headerMap) headers[String(k)] = String(v)
-    }
+    const result = g.withStrings(
+      [this.host, JSON.stringify(payload), ask.modelKey, ask.source ?? 'system'],
+      ([host, body, key, source], [hostLen, bodyLen, keyLen, sourceLen]) => g.callPointer((stack) => {
+        g.exports.qodercontext_prepareInferRequest!(
+          stack, this.context, host, hostLen, body, bodyLen, key, keyLen, source, sourceLen,
+        )
+      }),
+    )
 
     const readResultString = (invoke: (stack: number, ptr: number) => void): string => {
       let out = ''
+      let outPtr = 0
+      let outLen = 0
       const v = g.view()
       const stack = g.exports.__wbindgen_add_to_stack_pointer!(-16)
       try {
         invoke(stack, result)
-        const ptr = v.getInt32(stack + 0, true)
-        const len = v.getInt32(stack + 4, true)
-        out = ptr ? g.readString(ptr, len) : ''
+        outPtr = v.getInt32(stack + 0, true)
+        outLen = v.getInt32(stack + 4, true)
+        out = outPtr ? g.readString(outPtr, outLen) : ''
       } finally {
         g.exports.__wbindgen_add_to_stack_pointer!(16)
+        // The url/body buffers are allocated by the wasm side and never freed
+        // by it — `callString` already frees its return value the same way, and
+        // leaving these leaked grew the heap once per inference request (#826).
+        //
+        // ⚠️ Inline `__wbindgen_export4` rather than a `g.freeString` helper:
+        // the helper was for **input** buffers, whose ownership sits in Rust, and
+        // freeing those traps (#895). A *returned* buffer is owned by JS here,
+        // exactly like `callString`'s finally block, so freeing is correct.
+        if (outPtr) g.exports.__wbindgen_export4!(outPtr, outLen, 1)
       }
       return out
     }
 
-    return {
-      // ⚠️ 参数顺序：(栈指针, ptr) —— 与直觉相反
-      url: readResultString((stack, ptr) => g.exports.requestresult_url!(stack, ptr)),
-      headers,
-      body: readResultString((stack, ptr) => g.exports.requestresult_body!(stack, ptr)),
+    try {
+      const headerMap = g.takeObject(g.exports.requestresult_headers!(result))
+      const headers: Record<string, string> = {}
+      if (headerMap instanceof Map) {
+        for (const [k, v] of headerMap) headers[String(k)] = String(v)
+      }
+      return {
+        // ⚠️ 参数顺序：(栈指针, ptr) —— 与直觉相反
+        url: readResultString((stack, ptr) => g.exports.requestresult_url!(stack, ptr)),
+        headers,
+        body: readResultString((stack, ptr) => g.exports.requestresult_body!(stack, ptr)),
+      }
+    } finally {
+      g.exports.__wbg_requestresult_free!(result)
     }
+  }
+
+  /**
+   * Release the wasm `QoderContext` this client owns.
+   *
+   * A client is built per request and then dropped (`buildRequest` in the
+   * adapter), so without this the context's wasm allocations are never
+   * returned — measured at ~3 KiB of linear memory per request, which only ever
+   * grows (issue #826). `qodercontext_new` and `__wbg_qodercontext_free` exist
+   * as a pair for exactly this. Idempotent: a second call is a no-op.
+   */
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    if (this.context) this.g.exports.__wbg_qodercontext_free!(this.context)
   }
 }
 

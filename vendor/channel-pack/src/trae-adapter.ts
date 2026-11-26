@@ -1,17 +1,9 @@
+import { withQueueAccountRotation } from './queue-rotation.js'
+import { checkQueuedResponse } from './model-queue.js'
 /**
  * TRAE（字节跳动 TRAE IDE）LLM 适配器。
  *
- * 骨架取自 `src/lobsterai-adapter.ts` / `src/buddy-adapter.ts`，但**载荷转换与 SSE 解析全部重写**。
- *
  * ## 与现有适配器的关键差异
- *
- * | 项 | TRAE | Buddy / LobsterAI |
- * |---|---|---|
- * | 请求体 | OpenAI → SOLO 转换（function/config_name/tools 归一化） | 透传 OpenAI 格式 |
- * | SSE 格式 | SOLO 自定义事件（output/token_usage/done/error）→ 转 OpenAI | 标准 OpenAI SSE |
- * | 请求头 | `Cloud-IDE-JWT <token>` + X-* 系列 | Bearer / X-LobsterAI-Client-* |
- * | 图片 | 不支持 | Buddy / LobsterAI 支持 |
- * | prompt_cache_key | 不发 | Buddy 发（腾讯前缀缓存） |
  *
  * 复用的是 `src/sse.ts` 的三个工具函数（`readWithIdleTimeout` / `resolveToolPairing` /
  * `normalizeToolArguments` / `isTruncatedArguments`）——它们处理的是 OpenAI 协议层的通用陷阱。
@@ -230,7 +222,7 @@ export interface TraeAdapterOptions {
    */
   resolveCredential: (modelId?: string) => Promise<TraeCredential | undefined>
   /** 静默续期凭据。 */
-  refresh: () => Promise<void>
+  refresh: (accountId?: string, reason?: 'auth') => Promise<void>
   /** 动态拉取远端模型列表；失败时回退到 `product.fallbackModels`。 */
   fetchRemoteModels?: () => Promise<TraeRemoteModel[]>
   fetchImpl?: typeof fetch
@@ -264,7 +256,6 @@ function contentToText(content: unknown): string {
     .join('')
 }
 
-/** 工具结果内嵌图片的载体文本（与 buddy / lobsterai 适配器同名同义）。 */
 const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
 
 /**
@@ -366,11 +357,6 @@ function collectImages(content: readonly unknown[], refs: Map<string, unknown>):
  *    工具返回值**，于是反复请求同一个工具，或凭空编造结果；
  * 3. `reasoning` 块被当作正文喂回，污染上下文。
  *
- * 三个兄弟适配器（`llm-adapter.ts` / `buddy-adapter.ts` /
- * `lobsterai-adapter.ts`）**都有**这一步 `serializeMessages`，只有 TRAE
- * 漏了 —— 本文件顶部甚至 already `import` 了 `resolveToolPairing` 却从未使用，
- * 说明当初就是打算写、但没接上。
- *
  * 序列化后的形状与 Go 端（`payload.go:PrepareBody`）的输入**完全一致**：
  * assistant 带 `tool_calls`（`function` 形态），工具结果展开为独立
  * `{role:'tool', tool_call_id}` 消息。随后 `transformToSOLOBody` 再按 SOLO
@@ -399,7 +385,7 @@ function serializeTraeMessages(
 
   // 工具结果内嵌图片（`read_image` 等）不能并入 `role:'tool'` 消息：该角色的
   // content 只能是字符串，且必须紧跟其 assistant tool_call，中间插消息会 400。
-  // 故挂起到其后的独立 user 消息统一发出（与 buddy / lobsterai 同款处理）。
+
   let pendingToolImages: Array<Record<string, unknown>> = []
   const flushToolImages = (): void => {
     if (pendingToolImages.length === 0) return
@@ -432,8 +418,10 @@ function serializeTraeMessages(
           },
         }))
       const text = contentToText(content)
+      if (text.trim().length === 0 && toolCalls.length === 0) continue
       // 正文为空且有工具调用时 content 必须为 null（对齐 Go 端：纯 tool_calls
       // 的 assistant 不回写空 content）。
+      flushToolImages()
       wire.push({
         role: 'assistant',
         content: text.length === 0 && toolCalls.length > 0 ? null : text,
@@ -442,6 +430,7 @@ function serializeTraeMessages(
       continue
     }
     if (message.role === 'system') {
+      flushToolImages()
       wire.push({ role: 'system', content: contentToText(message.content) })
       continue
     }
@@ -477,7 +466,8 @@ function serializeTraeMessages(
         // 有图：正文与图片合并为一条多模态 user 消息（parts 里已含文本块）。
         flushToolImages()
         wire.push({ role: 'user', content: parts })
-      } else {
+      } else if (text.trim().length > 0) {
+        flushToolImages()
         wire.push({ role: 'user', content: text })
       }
     }
@@ -503,8 +493,8 @@ function serializeTraeMessages(
       flushToolImages()
       wire.push({ role: 'user', content: parts ?? text })
     }
-    flushToolImages()
   }
+  flushToolImages()
   return wire
 }
 
@@ -563,6 +553,45 @@ function isTransportError(error: unknown): boolean {
   if (message.includes('fetch failed')) return true
   if (message.includes('econnreset') || message.includes('epipe') || message.includes('socket hang up')) return true
   return false
+}
+
+/**
+ * Trae 用量帧里的缓存命中量（#213）。
+ *
+ * 上游实测（见 issue 的原始报文）发的是 Anthropic 口径的
+ * `cache_read_input_tokens`（写入量在 `cache_creation_input_tokens`），
+ * 不是 openai-compat.ts 读的 OpenAI 口径。三处来源按优先级取首个有值的：
+ * 兼容其它 Trae 端点沿用 OpenAI 拼写的可能。
+ */
+function traeCacheReadTokens(usage: Record<string, unknown>): number {
+  const anthropic = usage.cache_read_input_tokens
+  if (typeof anthropic === 'number' && anthropic > 0) return anthropic
+  const details = usage.prompt_tokens_details
+  if (details != null && typeof details === 'object') {
+    const cached = (details as { cached_tokens?: unknown }).cached_tokens
+    if (typeof cached === 'number' && cached > 0) return cached
+  }
+  const openai = usage.prompt_cache_hit_tokens
+  if (typeof openai === 'number' && openai > 0) return openai
+  return 0
+}
+
+/**
+ * `raw` 是否为**完整的 JSON 对象**文本。
+ *
+ * 仅供 EOF 尾帧校验：EOF 补出的空行会让最后一条没有真实分隔符的事件进入
+ * 解析器，而 `parseTraeSSELine` 对空 data / 截断 JSON 仍返回事件名。若尾帧
+ * 是 `done`，必须确认 data 完整，否则不能把连接判为正常结束。
+ */
+function isCompleteJsonObject(raw: string): boolean {
+  const trimmed = raw.trim()
+  if (trimmed.length === 0) return false
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -1060,7 +1089,7 @@ export class TraeAdapter extends LlmAdapter {
     // 4. 发送请求（401/403 时刷新一次凭据后重试）
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
-      await this.options.refresh()
+      await this.options.refresh(undefined, 'auth')
       // 与主路径一致：按本模型选号（跳过正在限流的账号）。
       const refreshed = await this.options.resolveCredential(options.model)
       if (refreshed === undefined || refreshed.access_token.length === 0) {
@@ -1216,7 +1245,7 @@ export class TraeAdapter extends LlmAdapter {
         headers,
         body,
         signal: options.signal,
-      })
+      }).then(checkQueuedResponse)
     } catch (error) {
       if (options.signal?.aborted) throw error
       if (isTransportError(error)) {
@@ -1270,10 +1299,6 @@ export class TraeAdapter extends LlmAdapter {
     /**
      * 思考死循环检测（见 `createReasoningLoopDetector`）。命中后丢弃后续
      * reasoning 增量，收尾时发截断后的 block，并让 finish 报 max-tokens。
-     *
-     * 与 buddy 同因：`reasoning_tokens` **计入** `completion_tokens`，思考陷入
-     * 病态重复就把输出额度烧光、正文零产出，而 `finish` 若是 `stop`，UI 上
-     * 完全看不出错误。
      */
     const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
     let loopDetected = false
@@ -1303,6 +1328,7 @@ export class TraeAdapter extends LlmAdapter {
      * 就不发任何 chunk（与「空名字 tool_call」同型修法）。
      */
     const suppressor = createBlankReasoningSuppressor()
+    const proseSuppressor = createBlankReasoningSuppressor()
     const toolCalls = new Map<number, {
       index: number
       text: string
@@ -1315,6 +1341,14 @@ export class TraeAdapter extends LlmAdapter {
     const toolIds = new Map<number, string>()
     let buffer = ''
     let streamEnded = false
+    /**
+     * 连接是否在上游**没有**发送 `event:done` 的情况下自然结束（EOF）。
+     *
+     * ⚠️ 它不等于「正常结束」：只有 `event:done` 才能证明上游写完了整条回复。
+     * EOF 时仍要先冲刷解码器并解析最后一条可能缺结尾空行的事件，再用
+     * `!streamEnded` 把它归类为截断（见收尾的 `truncatedStream`）。
+     */
+    let eofReached = false
     let finishReason: 'stop' | 'tool_calls' | 'length' | undefined
     // SSE 事件累积状态（跨行累积 event + data）
     let currentEvent = ''
@@ -1357,8 +1391,19 @@ export class TraeAdapter extends LlmAdapter {
           }
           throw error
         }
-        if (result.done) break
-        buffer += decoder.decode(result.value, { stream: true })
+        if (result.done) {
+          // 上游直接关闭 body（没有 event:done）：先把 TextDecoder 里可能残留的
+          // 多字节序列冲刷出来，并补一个空行，让最后一条缺少结尾空行的
+          // `event:output` / `event:done` 仍按同一套 SSE 规则解析与分发。
+          //
+          // ⚠️ 这只是「把已到达的字节读完」，不代表正常结束；是否截断由收尾的
+          // `truncatedStream`（`!streamEnded`）判定，绝不能在这里伪造 done。
+          buffer += decoder.decode()
+          buffer += '\n\n'
+          eofReached = true
+        } else {
+          buffer += decoder.decode(result.value, { stream: true })
+        }
         let newline: number
         while ((newline = buffer.indexOf('\n')) !== -1) {
           const line = buffer.slice(0, newline)
@@ -1367,9 +1412,29 @@ export class TraeAdapter extends LlmAdapter {
           // 空行 = 事件分隔符 → 解析累积的事件
           if (line.trim().length === 0) {
             if (currentEvent.length > 0) {
-              const ev = parseTraeSSELine(currentEvent, currentData)
+              /**
+               * `eofReached` 为真时，缓冲区里只可能剩下没有真实空行分隔的尾帧
+               * （正常空行在前面的块循环里已经消费）。只有这种尾帧的 `done`
+               * 需要额外要求 data 是完整 JSON 对象；真实分隔的裸 done 仍按
+               * 原规则接受。
+               */
+              const isEofTail = eofReached
+              const rawEvent = currentEvent
+              const rawData = currentData
               currentEvent = ''
               currentData = ''
+              /**
+               * ⚠️ 校验必须**先于** `parseTraeSSELine`：`data: null` 能通过
+               * JSON.parse，但共享解析器随后会读取 `null.finish_reason` 并抛
+               * TypeError，后置校验根本来不及执行。无效尾帧按「未完成」跳过，
+               * 由收尾逻辑决定 max-tokens / EMPTY_RESPONSE。
+               */
+              if (isEofTail && rawEvent.trim() === 'done' && !isCompleteJsonObject(rawData)) {
+                // 事件帧本身证明上游已开工；但绝不能因此允许重放请求。
+                sawAnyUpstreamEvent = true
+                continue
+              }
+              const ev = parseTraeSSELine(rawEvent, rawData)
               if (ev === undefined) continue
               // 任何**可解析**的上游事件（含 metadata / timing_cost）都算
               // 「上游确实开工了」——此后绝不重放请求（见 sawAnyUpstreamEvent）。
@@ -1392,7 +1457,8 @@ export class TraeAdapter extends LlmAdapter {
 
                   if (Object.keys(delta).length > 0) {
                     // 按块类型分发
-                    if (delta.content !== undefined) {
+                    const textDelta = delta.content === undefined ? undefined : proseSuppressor.feed(delta.content as string)
+                    if (textDelta !== undefined) {
                       let block = blocks.find(c => c.kind === 'text')
                       if (block === undefined) {
                         block = { index: nextIndex++, kind: 'text', text: '' }
@@ -1402,14 +1468,14 @@ export class TraeAdapter extends LlmAdapter {
                       // 正文死循环守卫（见 `proseLoopGuard` 注释）。命中后只停止
                       // 累积与发射，绝不 `reader.cancel()`、绝不改 finish reason。
                       if (proseLoopGuard !== undefined) {
-                        if (proseLoopGuard.observe(delta.content as string)) proseLoopDetected = true
+                        if (proseLoopGuard.observe(textDelta)) proseLoopDetected = true
                       }
                       // ⚠️ **不要在这里逐帧探测 think 标签**（2026-09-27 移除）：
                       // 跨帧必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
                       // 改为收尾无条件调用 `splitThinkTaggedContent`。
                       if (!proseLoopDetected) {
-                        block.text += delta.content as string
-                        yield { type: 'text-delta', index: block.index, text: delta.content as string }
+                        block.text += textDelta
+                        yield { type: 'text-delta', index: block.index, text: textDelta }
                       }
                     }
                     if (delta.reasoning_content !== undefined) {
@@ -1466,7 +1532,7 @@ export class TraeAdapter extends LlmAdapter {
                         const fragment = fn !== undefined && typeof fn.arguments === 'string' ? fn.arguments : ''
                         block.text += fragment
                         // ⚠️ **名称为空前不发射任何 chunk**（与 `openai-compat.ts` /
-                        // `buddy-adapter.ts` 同因同修）。只跳过收尾的 `block-end`
+
                         // 不够 —— `BlockAssembler` 会把没有 block-end 的 partial
                         // 也组装成 `name:''`，污染会话后让下游端点以 400 拒绝请求。
                         if (!block.announced) {
@@ -1500,11 +1566,17 @@ export class TraeAdapter extends LlmAdapter {
                     const promptTokens = typeof ev.usage.prompt_tokens === 'number' ? ev.usage.prompt_tokens : 0
                     const completionTokens = typeof ev.usage.completion_tokens === 'number' ? ev.usage.completion_tokens : 0
                     const reasoningTokens = typeof ev.usage.reasoning_tokens === 'number' ? ev.usage.reasoning_tokens : undefined
+                    // prompt_tokens 是**含缓存**的总量（#213 实测：prompt_tokens 4233
+                    // 里已含 cache_read_input_tokens 4224），所以 inputTokens 只计
+                    // 未命中部分，命中量单列 cacheReadTokens —— 与 openai-compat.ts
+                    // 的 DSH 口径一致，否则缓存命中率恒为 0、账本全按 cacheMiss 计价。
+                    const cachedTokens = traeCacheReadTokens(ev.usage)
                     yield {
                       type: 'usage',
                       usage: {
-                        inputTokens: promptTokens,
+                        inputTokens: cachedTokens > 0 ? promptTokens - cachedTokens : promptTokens,
                         outputTokens: completionTokens,
+                        ...cachedTokens > 0 ? { cacheReadTokens: cachedTokens } : {},
                         ...reasoningTokens !== undefined && reasoningTokens > 0 ? { reasoningTokens } : {},
                       },
                     }
@@ -1512,6 +1584,7 @@ export class TraeAdapter extends LlmAdapter {
                   break
                 }
                 case 'done':
+                  // EOF 尾帧的数据完整性已在上方进入共享解析器前校验。
                   if (ev.finishReason !== undefined) {
                     finishReason = ev.finishReason as 'stop' | 'tool_calls' | 'length'
                   }
@@ -1577,8 +1650,10 @@ export class TraeAdapter extends LlmAdapter {
           await reader.cancel().catch(() => {})
           break
         }
+        if (eofReached) break
       }
     } finally {
+      await reader.cancel().catch(() => {})
       reader.releaseLock()
     }
 
@@ -1682,10 +1757,12 @@ export class TraeAdapter extends LlmAdapter {
       const cleaned = stripCourseLeakIfEnabled(truncated)
       // ⚠️ 归位后正文可能为空串 —— 空块会污染会话，且 DSH 的
       // `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，故仍有产出。
-      if (cleaned !== '') {
+      if (cleaned.trim() !== '') {
         blockCount += 1
         emittedProse = cleaned
         yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } }
+      } else {
+        yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: '' } }
       }
     }
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
@@ -1724,12 +1801,18 @@ export class TraeAdapter extends LlmAdapter {
       && toolOrder.length === 0
       && isProseTruncatedByStopString(emittedProse)
     /**
-     * 思考死循环是否**是唯一的产出**（无正文、无工具调用）。
+     * 连接是否**被掐断**：既没有显式 `finish_reason` / `event:done`，也没有
+     * 命中更具体的死循环错误。
      *
-     * ⚠️ 与 `buddy-adapter.ts` / `openai-compat.ts` 同因同修（Gitee !IKIZNK）：
-     * 只有该步没有可见产出时才报 `error` —— `error` 路径**不落
-     * `assistant/message`**（实测 219 会话里 222 例），有正文/工具调用时报它会把
-     * 用户可见内容整块丢掉。实测守卫命中的 25 例全部只有思考。
+     * `blockCount > 0` 是必要门禁：只有 metadata / 空内容的提前 EOF 继续走
+     * `EMPTY_RESPONSE`，不能被改写成 `max-tokens`。
+     *
+     * ⚠️ 收到 `event:done`（`streamEnded`）但没带 `finish_reason` 时仍按完成处理，
+     * 继续报 `stop` —— 上游已明确宣告结束，不能把正常 done 误判成截断。
+     */
+    const truncatedStream = finishReason === undefined && !streamEnded && blockCount > 0
+    /**
+     * 思考死循环是否**是唯一的产出**（无正文、无工具调用）。
      */
     const reasoningLoopIsSoleOutput = loopDetected
       && emittedProse === ''
@@ -1750,6 +1833,7 @@ export class TraeAdapter extends LlmAdapter {
         || (finishReason === undefined && toolOrder.length > 0)
         || argsTruncated
         || proseCutByStopString
+        || truncatedStream
         || (droppedUnnamedCalls && toolOrder.length === 0)
         ? { kind: 'max-tokens' as const }
         : finishReason === 'tool_calls' || toolOrder.length > 0
@@ -1840,7 +1924,7 @@ export class TraeAdapter extends LlmAdapter {
  */
 export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): TraeAdapter {
   const product = options.product ?? TRAE
-  const adapter = new TraeAdapter(options)
+  const adapter = withQueueAccountRotation(product.id, options, scoped => new TraeAdapter(scoped))
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Channel Pack 的「显示列表」需要它的 `listAllModels()`（不受用户黑名单
   // 影响的全量目录，带最终展示名/倍率）。DSH 的 `ctx.llm` 不透传自定义方法，
