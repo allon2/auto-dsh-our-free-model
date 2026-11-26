@@ -13,7 +13,7 @@
   "license": "MIT",
   "source": {
     "repository": "https://github.com/allon2/auto-dsh-our-free-model",
-    "revision": "3a621b1eaf3daab533616778ee620e22f0292ba8"
+    "revision": "79d49cf9dc913aebd18ecc838fa9b2542257de4a"
   },
   "x-ecosystem-packaging": {
     "adapterIsolation": "adapter/kernel.js is the only module that may import @deepseek-ai/*; enforced by scripts/catalog-test.mjs",
